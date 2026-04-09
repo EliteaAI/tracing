@@ -1,0 +1,30 @@
+{
+  "$schema": "https://elitea.ai/admin-config-schema/v1",
+  "plugin": "tracing",
+  "properties": {
+    "tracing_enabled": {
+      "type": "boolean",
+      "title": "Tracing",
+      "description": "Master switch to enable or disable all distributed tracing.",
+      "path": "enabled",
+      "section": "observability",
+      "default": true,
+      "requires_restart": true,
+      "sync_targets": [
+        { "pylon": "pylon_indexer", "plugin": "tracing", "path": "enabled" }
+      ]
+    },
+    "audit_trail_enabled": {
+      "type": "boolean",
+      "title": "Audit Trail",
+      "description": "Enable audit trail that persists user actions and agent tool calls to the database.",
+      "path": "audit_trail.enabled",
+      "section": "observability",
+      "default": true,
+      "requires_restart": true,
+      "sync_targets": [
+        { "pylon": "pylon_indexer", "plugin": "tracing", "path": "audit_trail.enabled" }
+      ]
+    }
+  }
+}
