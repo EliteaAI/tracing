@@ -6,7 +6,7 @@ enabled: false
 # OTEL Collector Configuration
 # All telemetry is now routed through the OTEL Collector for unified routing
 otlp:
-  enabled: true
+  enabled: false
   endpoint: "http://otel-collector:4317"       # gRPC endpoint (Collector)
   http_endpoint: "http://otel-collector:4318"  # HTTP endpoint (for browser proxy)
   insecure: true                               # Use insecure connection (no TLS)
@@ -51,8 +51,8 @@ exclude:
 
 # Service identification
 service:
-  name: "pylon-main"
-  environment: "development"    # development, staging, production
+  name: "pylon"
+  environment: "unknown"    # development, staging, production
 
 # Trace context header names
 headers:
