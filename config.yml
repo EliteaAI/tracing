@@ -1,7 +1,7 @@
 # Tracing Plugin Configuration
 
 # Master switch - enable/disable all tracing
-enabled: true
+enabled: false
 
 # OTEL Collector Configuration
 # All telemetry is now routed through the OTEL Collector for unified routing
