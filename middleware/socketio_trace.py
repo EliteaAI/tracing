@@ -155,16 +155,15 @@ class SocketIOTraceWrapper:
                         from_baggage=True,  # Check propagated baggage
                         kwargs=kwargs
                     )
-                    # Also check if user_id is in event data
+                    # Also check if user_id/project_id is in event data
+                    # For SIO events the project_id in the payload IS the
+                    # user's active project (validated by the handler via
+                    # auth.is_sio_user_in_project), so it is safe to keep.
                     if len(args) > 1 and isinstance(args[1], dict):
                         event_data = args[1]
                         if 'user_id' in event_data or 'project_id' in event_data:
                             from ..utils.user_context import extract_user_from_kwargs
-                            # Only extract user_id from event data, NOT project_id
-                            # The project_id in event payload is the target entity's project,
-                            # not necessarily the calling user's active project
                             user_attrs_from_event = extract_user_from_kwargs(event_data)
-                            user_attrs_from_event.pop('project.id', None)  # Never override project from payload
                             user_attrs.update(user_attrs_from_event)
                     attributes.update(user_attrs)
                 except Exception as e:
