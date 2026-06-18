@@ -186,9 +186,8 @@ class FlaskTraceHooks:
             attributes=attributes,
         )
 
-        # Debug: log span creation
         span_ctx = span.get_span_context()
-        log.info(f"[FLASK_TRACE] Created span: {span_name} trace_id={format(span_ctx.trace_id, '032x')} span_id={format(span_ctx.span_id, '016x')}")
+        log.debug("[FLASK_TRACE] Created span: %s trace_id=%s span_id=%s", span_name, format(span_ctx.trace_id, '032x'), format(span_ctx.span_id, '016x'))
 
         # Attach the span to the current context
         token = otel_context.attach(trace.set_span_in_context(span))
@@ -290,9 +289,8 @@ class FlaskTraceHooks:
             # End the span (always, even if there was an error recording attributes)
             try:
                 span_ctx = span.get_span_context()
-                log.info(f"[FLASK_TRACE] Ending span: trace_id={format(span_ctx.trace_id, '032x')} span_id={format(span_ctx.span_id, '016x')} status={response.status_code}")
+                log.debug("[FLASK_TRACE] Ending span: trace_id=%s span_id=%s status=%s", format(span_ctx.trace_id, '032x'), format(span_ctx.span_id, '016x'), response.status_code)
                 span.end()
-                log.info(f"[FLASK_TRACE] Span ended successfully")
             except Exception as e:
                 log.warning(f"Error ending span: {e}")
 
