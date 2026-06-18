@@ -66,7 +66,7 @@ class AuditLangChainCallback:
             key = str(run_id)
             self._spans[key] = span
             self._start_times[key] = time.perf_counter()
-            log.info(f"[AUDIT_TOOL_DEBUG] Tool started: {tool_name}, run_id: {run_id}, user_attrs: {self._user_attrs}")
+            log.debug("[AUDIT_TOOL_DEBUG] Tool started: %s run_id: %s", tool_name, run_id)
         except Exception as e:
             log.error(f"AuditLangChainCallback: failed to start tool span: {e}", exc_info=True)
 
@@ -79,7 +79,7 @@ class AuditLangChainCallback:
                 if start is not None:
                     span.set_attribute("audit.duration_ms", (time.perf_counter() - start) * 1000)
                 span.end()
-                log.info(f"[AUDIT_TOOL_DEBUG] Tool ended: run_id: {run_id}, duration: {(time.perf_counter() - start) * 1000 if start else 'N/A'}ms")
+                log.debug("[AUDIT_TOOL_DEBUG] Tool ended: run_id: %s", run_id)
             except Exception:
                 pass
 
@@ -93,7 +93,7 @@ class AuditLangChainCallback:
                 if start is not None:
                     span.set_attribute("audit.duration_ms", (time.perf_counter() - start) * 1000)
                 span.end()
-                log.info(f"[AUDIT_TOOL_DEBUG] Tool error: run_id: {run_id}, error: {error}")
+                log.debug("[AUDIT_TOOL_DEBUG] Tool error: run_id: %s error: %s", run_id, error)
             except Exception:
                 pass
 
