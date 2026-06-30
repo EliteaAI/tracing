@@ -130,7 +130,13 @@ class AuditSpanProcessor:
             self._worker.join(timeout=5)
 
     def force_flush(self, timeout_millis=None):
-        pass
+        # OTEL contract: force_flush must return a bool. Audit events are
+        # enqueued synchronously in on_end via this processor's own worker, so
+        # there is nothing to flush here, but returning None (falsy) makes a
+        # multi-span-processor force_flush treat this as a failure and, on some
+        # opentelemetry-sdk versions, abort before reaching later processors
+        # (e.g. Langfuse) — see issue #5391.
+        return True
 
     # --- Background worker (own thread — blocking write_fn is fine here) ---
 

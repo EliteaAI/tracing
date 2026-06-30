@@ -1138,6 +1138,49 @@ class Module(module.ModuleModel):
             'sampling_rate': self.config.get('sampling', {}).get('rate', 1.0),
         }
 
+    def flush_span_processors(self, timeout_millis: int = 5000) -> int:
+        """Force-flush every span processor on the tracer provider independently.
+
+        The shared TracerProvider drives its processors through a
+        SynchronousMultiSpanProcessor whose force_flush() shares a single
+        deadline across all processors (and, on some opentelemetry-sdk versions,
+        aborts on the first processor returning a falsy result). In the forked
+        task workers the platform's fork-unsafe OTLP gRPC exporter can block
+        until that shared deadline is exhausted, starving every later processor
+        — including Langfuse's — so the final span batch is never exported
+        (issues #5391 / #5390).
+
+        Flushing each processor on its own decouples them: a slow or failing
+        processor can no longer skip the others. Returns the number of
+        processors that flushed without reporting a failure.
+        """
+        if not self._enabled or self.tracer_provider is None:
+            return 0
+
+        active = getattr(self.tracer_provider, "_active_span_processor", None)
+        processors = getattr(active, "_span_processors", None)
+        if not processors:
+            log.warning(
+                "flush_span_processors: tracer provider exposes no _span_processors "
+                f"(active={type(active).__name__ if active is not None else None}); nothing flushed."
+            )
+            return 0
+
+        flushed = 0
+        for processor in processors:
+            name = type(processor).__name__
+            try:
+                # A None return (no value) is treated as success, matching the
+                # OTEL convention that force_flush returns True/None on success.
+                if processor.force_flush(timeout_millis) is not False:
+                    flushed += 1
+                else:
+                    log.warning(f"flush_span_processors: {name} reported a failed force_flush.")
+            except Exception as e:
+                log.warning(f"flush_span_processors: {name} raised during force_flush: {e}")
+        log.debug(f"flush_span_processors flushed {flushed}/{len(processors)} processor(s)")
+        return flushed
+
     def get_task_wrapper(self):
         """
         Get a task wrapper factory for wrapping arbiter task handlers.
@@ -1231,7 +1274,9 @@ class Module(module.ModuleModel):
         if self._enabled and self.tracer_provider:
             log.info("Shutting down tracing...")
             try:
-                self.tracer_provider.force_flush()
+                # Per-processor flush so a stuck processor can't skip the others
+                # (same starvation issue as the per-task hot path — see #5391).
+                self.flush_span_processors(timeout_millis=10000)
                 self.tracer_provider.shutdown()
             except Exception as e:
                 log.warning(f"Error during tracing shutdown: {e}")
