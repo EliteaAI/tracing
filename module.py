@@ -1160,11 +1160,22 @@ class Module(module.ModuleModel):
         active = getattr(self.tracer_provider, "_active_span_processor", None)
         processors = getattr(active, "_span_processors", None)
         if not processors:
+            # OTEL internal layout changed (private attrs renamed/removed): fall
+            # back to the public force_flush so we still flush *something* rather
+            # than silently flushing nothing — which would reintroduce #5391 on
+            # an SDK bump. This is the shared-deadline path we normally avoid, so
+            # it is best-effort only.
             log.warning(
                 "flush_span_processors: tracer provider exposes no _span_processors "
-                f"(active={type(active).__name__ if active is not None else None}); nothing flushed."
+                f"(active={type(active).__name__ if active is not None else None}); "
+                "falling back to tracer_provider.force_flush()."
             )
-            return 0
+            try:
+                self.tracer_provider.force_flush(timeout_millis)
+                return 1
+            except Exception as e:
+                log.warning(f"flush_span_processors: fallback force_flush failed: {e}")
+                return 0
 
         flushed = 0
         for processor in processors:
