@@ -1139,20 +1139,13 @@ class Module(module.ModuleModel):
         }
 
     def flush_span_processors(self, timeout_millis: int = 5000) -> int:
-        """Force-flush every span processor on the tracer provider independently.
+        """Force-flush every span processor independently; return the count flushed.
 
-        The shared TracerProvider drives its processors through a
-        SynchronousMultiSpanProcessor whose force_flush() shares a single
-        deadline across all processors (and, on some opentelemetry-sdk versions,
-        aborts on the first processor returning a falsy result). In the forked
-        task workers the platform's fork-unsafe OTLP gRPC exporter can block
-        until that shared deadline is exhausted, starving every later processor
-        — including Langfuse's — so the final span batch is never exported
-        (issues #5391 / #5390).
-
-        Flushing each processor on its own decouples them: a slow or failing
-        processor can no longer skip the others. Returns the number of
-        processors that flushed without reporting a failure.
+        The provider's SynchronousMultiSpanProcessor.force_flush() shares one
+        deadline across processors, so a fork-unsafe OTLP exporter blocking in a
+        forked worker can exhaust it and skip later processors (incl. Langfuse),
+        dropping the final span batch (#5391 / #5390). Flushing each on its own
+        decouples them.
         """
         if not self._enabled or self.tracer_provider is None:
             return 0
@@ -1160,11 +1153,9 @@ class Module(module.ModuleModel):
         active = getattr(self.tracer_provider, "_active_span_processor", None)
         processors = getattr(active, "_span_processors", None)
         if not processors:
-            # OTEL internal layout changed (private attrs renamed/removed): fall
-            # back to the public force_flush so we still flush *something* rather
-            # than silently flushing nothing — which would reintroduce #5391 on
-            # an SDK bump. This is the shared-deadline path we normally avoid, so
-            # it is best-effort only.
+            # OTEL private attrs renamed/removed: fall back to the public
+            # force_flush rather than flush nothing (which would reintroduce
+            # #5391 on an SDK bump). Best-effort — this is the shared-deadline path.
             log.warning(
                 "flush_span_processors: tracer provider exposes no _span_processors "
                 f"(active={type(active).__name__ if active is not None else None}); "
@@ -1181,8 +1172,7 @@ class Module(module.ModuleModel):
         for processor in processors:
             name = type(processor).__name__
             try:
-                # A None return (no value) is treated as success, matching the
-                # OTEL convention that force_flush returns True/None on success.
+                # None is treated as success (OTEL force_flush returns True/None).
                 if processor.force_flush(timeout_millis) is not False:
                     flushed += 1
                 else:
@@ -1285,8 +1275,7 @@ class Module(module.ModuleModel):
         if self._enabled and self.tracer_provider:
             log.info("Shutting down tracing...")
             try:
-                # Per-processor flush so a stuck processor can't skip the others
-                # (same starvation issue as the per-task hot path — see #5391).
+                # Per-processor flush so a stuck processor can't skip the others (#5391).
                 self.flush_span_processors(timeout_millis=10000)
                 self.tracer_provider.shutdown()
             except Exception as e:
