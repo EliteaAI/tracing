@@ -130,7 +130,10 @@ class AuditSpanProcessor:
             self._worker.join(timeout=5)
 
     def force_flush(self, timeout_millis=None):
-        pass
+        # Nothing to flush (events are enqueued in on_end), but return True, not
+        # None: a falsy result can make a multi-processor force_flush treat this
+        # as failure and skip later processors, e.g. Langfuse (#5391).
+        return True
 
     # --- Background worker (own thread — blocking write_fn is fine here) ---
 
