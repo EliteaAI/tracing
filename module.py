@@ -146,6 +146,8 @@ class Module(module.ModuleModel):
         audit_config = self.config.get('audit_trail', {})
         if audit_config.get('enabled', False):
             self._init_audit_trail(audit_config)
+            # Register lifecycle event handlers (pylon_started -> audit trail)
+            self.descriptor.init_events()
 
         log.info("Tracing plugin initialization complete")
 
