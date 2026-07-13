@@ -134,3 +134,18 @@ def test_build_event_llm_cost_passthrough():
     assert event.get("input_tokens") == 100, event
     assert event.get("output_tokens") == 40, event
     assert abs(event.get("llm_cost", 0) - 0.00123456) < 1e-10, event
+
+
+def test_extract_llm_non_numeric_string_graceful():
+    """Non-numeric string attributes should not crash, tokens become None."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "audit.observation.type": "generation",
+        "audit.model.name": "gpt-4o",
+        "audit.input_tokens": "N/A",
+        "audit.output_tokens": "unknown",
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event is not None
+    assert event.get("input_tokens") is None, event
+    assert event.get("output_tokens") is None, event

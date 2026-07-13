@@ -160,9 +160,8 @@ class AuditLangChainCallback:
                     span.set_attribute("audit.input_tokens", input_tokens)
                 if output_tokens is not None:
                     span.set_attribute("audit.output_tokens", output_tokens)
+            finally:
                 span.end()
-            except Exception:
-                pass
 
     @staticmethod
     def _extract_tokens(response):
