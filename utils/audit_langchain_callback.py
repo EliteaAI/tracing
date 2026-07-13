@@ -155,9 +155,43 @@ class AuditLangChainCallback:
             try:
                 if start is not None:
                     span.set_attribute("audit.duration_ms", (time.perf_counter() - start) * 1000)
+                input_tokens, output_tokens = self._extract_tokens(response)
+                if input_tokens is not None:
+                    span.set_attribute("audit.input_tokens", input_tokens)
+                if output_tokens is not None:
+                    span.set_attribute("audit.output_tokens", output_tokens)
                 span.end()
             except Exception:
                 pass
+
+    @staticmethod
+    def _extract_tokens(response):
+        """Extract (input_tokens, output_tokens) from a LangChain LLMResult."""
+        try:
+            if response is None:
+                return None, None
+            llm_out = getattr(response, 'llm_output', None) or {}
+            tu = llm_out.get('token_usage') if isinstance(llm_out, dict) else None
+            if tu:
+                inp = tu.get('prompt_tokens') or tu.get('input_tokens')
+                out = tu.get('completion_tokens') or tu.get('output_tokens')
+                if inp is not None or out is not None:
+                    return inp, out
+            generations = getattr(response, 'generations', None) or []
+            for gen_list in generations:
+                for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                    msg = getattr(gen, 'message', None)
+                    if msg is None:
+                        continue
+                    usage = getattr(msg, 'usage_metadata', None)
+                    if usage and isinstance(usage, dict):
+                        inp = usage.get('input_tokens') or usage.get('prompt_tokens')
+                        out = usage.get('output_tokens') or usage.get('completion_tokens')
+                        if inp is not None or out is not None:
+                            return inp, out
+            return None, None
+        except Exception:
+            return None, None
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         key = str(run_id)
