@@ -35,17 +35,17 @@ sys.modules.setdefault("opentelemetry.trace", _otel_trace)
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
-class _FakeMessage:
+class FakeMessage:
     def __init__(self, usage_metadata=None):
         self.usage_metadata = usage_metadata
 
 
-class _FakeGeneration:
+class FakeGeneration:
     def __init__(self, message=None):
         self.message = message
 
 
-class _FakeResponse:
+class FakeResponse:
     def __init__(self, llm_output=None, generations=None):
         self.llm_output = llm_output
         self.generations = generations or []
@@ -60,7 +60,7 @@ def test_none_response():
 
 
 def test_openai_style_llm_output():
-    resp = _FakeResponse(llm_output={"token_usage": {"prompt_tokens": 100, "completion_tokens": 50}})
+    resp = FakeResponse(llm_output={"token_usage": {"prompt_tokens": 100, "completion_tokens": 50}})
     inp, out = _extract(resp)
     assert inp == 100, f"expected 100 input tokens, got {inp}"
     assert out == 50, f"expected 50 output tokens, got {out}"
@@ -68,7 +68,7 @@ def test_openai_style_llm_output():
 
 def test_anthropic_style_llm_output():
     """Anthropic uses input_tokens / output_tokens key names."""
-    resp = _FakeResponse(llm_output={"token_usage": {"input_tokens": 200, "output_tokens": 80}})
+    resp = FakeResponse(llm_output={"token_usage": {"input_tokens": 200, "output_tokens": 80}})
     inp, out = _extract(resp)
     assert inp == 200, inp
     assert out == 80, out
@@ -76,9 +76,9 @@ def test_anthropic_style_llm_output():
 
 def test_usage_metadata_modern():
     """Modern models expose tokens via generation.message.usage_metadata."""
-    msg = _FakeMessage(usage_metadata={"input_tokens": 300, "output_tokens": 120})
-    gen = _FakeGeneration(message=msg)
-    resp = _FakeResponse(generations=[[gen]])
+    msg = FakeMessage(usage_metadata={"input_tokens": 300, "output_tokens": 120})
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
     inp, out = _extract(resp)
     assert inp == 300, inp
     assert out == 120, out
@@ -86,9 +86,9 @@ def test_usage_metadata_modern():
 
 def test_usage_metadata_prompt_completion_keys():
     """Fallback key names inside usage_metadata."""
-    msg = _FakeMessage(usage_metadata={"prompt_tokens": 50, "completion_tokens": 20})
-    gen = _FakeGeneration(message=msg)
-    resp = _FakeResponse(generations=[[gen]])
+    msg = FakeMessage(usage_metadata={"prompt_tokens": 50, "completion_tokens": 20})
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
     inp, out = _extract(resp)
     assert inp == 50, inp
     assert out == 20, out
@@ -96,9 +96,9 @@ def test_usage_metadata_prompt_completion_keys():
 
 def test_llm_output_preferred_over_usage_metadata():
     """llm_output takes priority when both present."""
-    msg = _FakeMessage(usage_metadata={"input_tokens": 999, "output_tokens": 999})
-    gen = _FakeGeneration(message=msg)
-    resp = _FakeResponse(
+    msg = FakeMessage(usage_metadata={"input_tokens": 999, "output_tokens": 999})
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(
         llm_output={"token_usage": {"prompt_tokens": 10, "completion_tokens": 5}},
         generations=[[gen]],
     )
@@ -108,7 +108,7 @@ def test_llm_output_preferred_over_usage_metadata():
 
 
 def test_no_token_data_returns_none():
-    resp = _FakeResponse(llm_output={}, generations=[])
+    resp = FakeResponse(llm_output={}, generations=[])
     inp, out = _extract(resp)
     assert inp is None, inp
     assert out is None, out
@@ -116,16 +116,16 @@ def test_no_token_data_returns_none():
 
 def test_malformed_usage_metadata_does_not_crash():
     """Non-dict usage_metadata must not raise."""
-    msg = _FakeMessage(usage_metadata="not_a_dict")
-    gen = _FakeGeneration(message=msg)
-    resp = _FakeResponse(generations=[[gen]])
+    msg = FakeMessage(usage_metadata="not_a_dict")
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
     inp, out = _extract(resp)
     assert inp is None and out is None, (inp, out)
 
 
 def test_zero_value_tokens_not_treated_as_missing():
     """Zero is a valid token count — must not be confused with None/missing."""
-    resp = _FakeResponse(llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 50}})
+    resp = FakeResponse(llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 50}})
     inp, out = _extract(resp)
     assert inp == 0, f"expected 0, got {inp}"
     assert out == 50, f"expected 50, got {out}"
@@ -133,9 +133,9 @@ def test_zero_value_tokens_not_treated_as_missing():
 
 def test_zero_value_via_usage_metadata():
     """Zero tokens via usage_metadata path."""
-    msg = _FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 0})
-    gen = _FakeGeneration(message=msg)
-    resp = _FakeResponse(generations=[[gen]])
+    msg = FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 0})
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
     inp, out = _extract(resp)
     assert inp == 0, f"expected 0, got {inp}"
     assert out == 0, f"expected 0, got {out}"

@@ -1,6 +1,6 @@
 -- Migration: 003_add_token_cost_columns
 -- Date: 2026-07-13
--- Issue: https://github.com/EliteaAI/elitea_issues/issues/<TBD>
+-- Issue: ADR-0008 Analytics Enhancement
 -- Description: Add LLM token usage and cost tracking columns to audit_events
 
 ALTER TABLE centry.audit_events
