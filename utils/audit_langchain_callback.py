@@ -5,11 +5,20 @@ Used as a fallback when Langfuse is not configured, ensuring tool calls
 and LLM calls always appear in the audit trail.
 """
 
+import json
+import os
 import time
 
 from pylon.core.tools import log
 
 AUDIT_TRACER_NAME = "audit-trail"
+
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    with open(os.path.join(_PLUGIN_DIR, "metadata.json"), "r") as _f:
+        _PLUGIN_VERSION = json.load(_f).get("version", "0.0.0")
+except Exception:
+    _PLUGIN_VERSION = "0.0.0"
 
 
 class AuditLangChainCallback:
@@ -31,7 +40,7 @@ class AuditLangChainCallback:
 
     def __init__(self, user_id=None, user_email=None, project_id=None):
         from opentelemetry import trace
-        self._tracer = trace.get_tracer(AUDIT_TRACER_NAME, "1.0.0")
+        self._tracer = trace.get_tracer(AUDIT_TRACER_NAME, _PLUGIN_VERSION)
         self._spans = {}
         self._start_times = {}
         # User context to propagate to every span
