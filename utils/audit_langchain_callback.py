@@ -173,8 +173,8 @@ class AuditLangChainCallback:
             llm_out = getattr(response, 'llm_output', None) or {}
             tu = llm_out.get('token_usage') if isinstance(llm_out, dict) else None
             if tu:
-                inp = tu.get('prompt_tokens') or tu.get('input_tokens')
-                out = tu.get('completion_tokens') or tu.get('output_tokens')
+                inp = tu.get('prompt_tokens') if 'prompt_tokens' in tu else tu.get('input_tokens')
+                out = tu.get('completion_tokens') if 'completion_tokens' in tu else tu.get('output_tokens')
                 if inp is not None or out is not None:
                     return inp, out
             generations = getattr(response, 'generations', None) or []
@@ -185,8 +185,8 @@ class AuditLangChainCallback:
                         continue
                     usage = getattr(msg, 'usage_metadata', None)
                     if usage and isinstance(usage, dict):
-                        inp = usage.get('input_tokens') or usage.get('prompt_tokens')
-                        out = usage.get('output_tokens') or usage.get('completion_tokens')
+                        inp = usage.get('input_tokens') if 'input_tokens' in usage else usage.get('prompt_tokens')
+                        out = usage.get('output_tokens') if 'output_tokens' in usage else usage.get('completion_tokens')
                         if inp is not None or out is not None:
                             return inp, out
             return None, None

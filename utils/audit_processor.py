@@ -322,8 +322,14 @@ class AuditSpanProcessor:
 
         raw_in = attrs.get("audit.input_tokens")
         raw_out = attrs.get("audit.output_tokens")
-        input_tokens = int(raw_in) if raw_in is not None else None
-        output_tokens = int(raw_out) if raw_out is not None else None
+        try:
+            input_tokens = int(raw_in) if raw_in is not None else None
+        except (ValueError, TypeError):
+            input_tokens = None
+        try:
+            output_tokens = int(raw_out) if raw_out is not None else None
+        except (ValueError, TypeError):
+            output_tokens = None
 
         return self._build_event(
             snap=snap,

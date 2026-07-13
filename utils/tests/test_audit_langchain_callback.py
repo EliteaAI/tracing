@@ -121,3 +121,21 @@ def test_malformed_usage_metadata_does_not_crash():
     resp = _FakeResponse(generations=[[gen]])
     inp, out = _extract(resp)
     assert inp is None and out is None, (inp, out)
+
+
+def test_zero_value_tokens_not_treated_as_missing():
+    """Zero is a valid token count — must not be confused with None/missing."""
+    resp = _FakeResponse(llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 50}})
+    inp, out = _extract(resp)
+    assert inp == 0, f"expected 0, got {inp}"
+    assert out == 50, f"expected 50, got {out}"
+
+
+def test_zero_value_via_usage_metadata():
+    """Zero tokens via usage_metadata path."""
+    msg = _FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 0})
+    gen = _FakeGeneration(message=msg)
+    resp = _FakeResponse(generations=[[gen]])
+    inp, out = _extract(resp)
+    assert inp == 0, f"expected 0, got {inp}"
+    assert out == 0, f"expected 0, got {out}"
