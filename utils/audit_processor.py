@@ -409,7 +409,8 @@ class AuditSpanProcessor:
 
         # Add optional fields
         for key in ("http_method", "http_route", "status_code", "duration_ms",
-                     "tool_name", "model_name"):
+                     "tool_name", "model_name", "input_tokens", "output_tokens",
+                     "llm_cost"):
             if key in extra and extra[key] is not None:
                 event[key] = extra[key]
 
