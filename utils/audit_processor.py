@@ -320,6 +320,11 @@ class AuditSpanProcessor:
         )
         duration_ms = attrs.get("audit.duration_ms")
 
+        raw_in = attrs.get("audit.input_tokens")
+        raw_out = attrs.get("audit.output_tokens")
+        input_tokens = int(raw_in) if raw_in is not None else None
+        output_tokens = int(raw_out) if raw_out is not None else None
+
         return self._build_event(
             snap=snap,
             attrs=attrs,
@@ -328,6 +333,8 @@ class AuditSpanProcessor:
             model_name=model_name,
             duration_ms=float(duration_ms) if duration_ms is not None else None,
             is_error=bool(attrs.get("audit.is_error", False)),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     # --- Event builder (runs on worker thread — blocking RPC is fine) ---
