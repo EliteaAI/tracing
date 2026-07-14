@@ -331,6 +331,12 @@ class AuditSpanProcessor:
         except (ValueError, TypeError):
             output_tokens = None
 
+        raw_cost = attrs.get("audit.llm_cost")
+        try:
+            llm_cost = float(raw_cost) if raw_cost is not None else None
+        except (ValueError, TypeError):
+            llm_cost = None
+
         return self._build_event(
             snap=snap,
             attrs=attrs,
@@ -341,6 +347,7 @@ class AuditSpanProcessor:
             is_error=bool(attrs.get("audit.is_error", False)),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            llm_cost=llm_cost,
         )
 
     # --- Event builder (runs on worker thread — blocking RPC is fine) ---

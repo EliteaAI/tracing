@@ -169,8 +169,32 @@ class AuditLangChainCallback:
                     span.set_attribute("audit.input_tokens", input_tokens)
                 if output_tokens is not None:
                     span.set_attribute("audit.output_tokens", output_tokens)
+                response_cost = self._extract_response_cost(response)
+                if response_cost is not None:
+                    span.set_attribute("audit.llm_cost", response_cost)
             finally:
                 span.end()
+
+    @staticmethod
+    def _extract_response_cost(response):
+        """Extract response_cost from LiteLLM's llm_output (OSS feature)."""
+        try:
+            if response is None:
+                return None
+            llm_out = getattr(response, 'llm_output', None) or {}
+            if not isinstance(llm_out, dict):
+                return None
+            cost = llm_out.get('response_cost')
+            if cost is not None:
+                return float(cost)
+            hidden = llm_out.get('_hidden_params') or {}
+            if isinstance(hidden, dict):
+                cost = hidden.get('response_cost')
+                if cost is not None:
+                    return float(cost)
+            return None
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _extract_tokens(response):
