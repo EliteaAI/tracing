@@ -139,3 +139,44 @@ def test_zero_value_via_usage_metadata():
     inp, out = _extract(resp)
     assert inp == 0, f"expected 0, got {inp}"
     assert out == 0, f"expected 0, got {out}"
+
+
+_extract_cost = AuditLangChainCallback._extract_response_cost
+
+
+def test_response_cost_from_llm_output():
+    resp = FakeResponse(llm_output={"response_cost": 0.0025})
+    assert _extract_cost(resp) == 0.0025
+
+
+def test_response_cost_from_hidden_params():
+    resp = FakeResponse(llm_output={"_hidden_params": {"response_cost": 0.01}})
+    assert _extract_cost(resp) == 0.01
+
+
+def test_response_cost_none_when_absent():
+    resp = FakeResponse(llm_output={})
+    assert _extract_cost(resp) is None
+
+
+def test_response_cost_zero_is_valid():
+    """Zero cost is a legitimate value, not missing."""
+    resp = FakeResponse(llm_output={"response_cost": 0})
+    assert _extract_cost(resp) == 0.0
+
+
+def test_response_cost_inf_returns_none():
+    """inf must be treated as missing so the audit row is not dropped on insert."""
+    resp = FakeResponse(llm_output={"response_cost": float("inf")})
+    assert _extract_cost(resp) is None
+
+
+def test_response_cost_nan_returns_none():
+    """nan must be treated as missing so the audit row is not dropped on insert."""
+    resp = FakeResponse(llm_output={"response_cost": float("nan")})
+    assert _extract_cost(resp) is None
+
+
+def test_response_cost_non_numeric_string_returns_none():
+    resp = FakeResponse(llm_output={"response_cost": "not-a-number"})
+    assert _extract_cost(resp) is None

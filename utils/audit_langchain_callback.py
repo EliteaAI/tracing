@@ -6,6 +6,7 @@ and LLM calls always appear in the audit trail.
 """
 
 import json
+import math
 import os
 import time
 
@@ -172,6 +173,8 @@ class AuditLangChainCallback:
                 response_cost = self._extract_response_cost(response)
                 if response_cost is not None:
                     span.set_attribute("audit.llm_cost", response_cost)
+            except Exception:
+                log.debug("[AUDIT_LLM_DEBUG] failed to set span attrs: run_id: %s", run_id)
             finally:
                 span.end()
 
@@ -186,12 +189,14 @@ class AuditLangChainCallback:
                 return None
             cost = llm_out.get('response_cost')
             if cost is not None:
-                return float(cost)
+                v = float(cost)
+                return v if math.isfinite(v) else None
             hidden = llm_out.get('_hidden_params') or {}
             if isinstance(hidden, dict):
                 cost = hidden.get('response_cost')
                 if cost is not None:
-                    return float(cost)
+                    v = float(cost)
+                    return v if math.isfinite(v) else None
             return None
         except (TypeError, ValueError):
             return None
