@@ -55,9 +55,11 @@ class AuditEvent(db.Base):
     model_name: Mapped[str] = mapped_column(String(256), nullable=True)
 
     # Token usage and cost tracking
+    # Numeric(18, 8): 10 integer digits (max ~1e10) so a large/misconfigured
+    # upstream response_cost is stored rather than failing the audit write.
     input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    llm_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 8), nullable=True)
+    llm_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8), nullable=True)
 
     # Trace linkage
     trace_id: Mapped[str] = mapped_column(String(32), nullable=True)
