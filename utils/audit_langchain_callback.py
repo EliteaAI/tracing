@@ -5,11 +5,21 @@ Used as a fallback when Langfuse is not configured, ensuring tool calls
 and LLM calls always appear in the audit trail.
 """
 
+import json
+import math
+import os
 import time
 
 from pylon.core.tools import log
 
 AUDIT_TRACER_NAME = "audit-trail"
+
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    with open(os.path.join(_PLUGIN_DIR, "metadata.json"), "r") as _f:
+        _PLUGIN_VERSION = json.load(_f).get("version", "0.0.0")
+except Exception:
+    _PLUGIN_VERSION = "0.0.0"
 
 
 class AuditLangChainCallback:
@@ -31,7 +41,7 @@ class AuditLangChainCallback:
 
     def __init__(self, user_id=None, user_email=None, project_id=None):
         from opentelemetry import trace
-        self._tracer = trace.get_tracer(AUDIT_TRACER_NAME, "1.0.0")
+        self._tracer = trace.get_tracer(AUDIT_TRACER_NAME, _PLUGIN_VERSION)
         self._spans = {}
         self._start_times = {}
         # User context to propagate to every span
@@ -155,9 +165,80 @@ class AuditLangChainCallback:
             try:
                 if start is not None:
                     span.set_attribute("audit.duration_ms", (time.perf_counter() - start) * 1000)
-                span.end()
+                input_tokens, output_tokens = self._extract_tokens(response)
+                if input_tokens is not None:
+                    span.set_attribute("audit.input_tokens", input_tokens)
+                if output_tokens is not None:
+                    span.set_attribute("audit.output_tokens", output_tokens)
+                response_cost = self._extract_response_cost(response)
+                if response_cost is not None:
+                    span.set_attribute("audit.llm_cost", response_cost)
             except Exception:
-                pass
+                log.debug("[AUDIT_LLM_DEBUG] failed to set span attrs: run_id: %s", run_id)
+            finally:
+                span.end()
+
+    @staticmethod
+    def _extract_response_cost(response):
+        """Extract response_cost from LiteLLM's llm_output (OSS feature)."""
+        try:
+            if response is None:
+                return None
+            llm_out = getattr(response, 'llm_output', None) or {}
+            if not isinstance(llm_out, dict):
+                return None
+            cost = llm_out.get('response_cost')
+            if cost is not None:
+                v = float(cost)
+                return v if math.isfinite(v) else None
+            hidden = llm_out.get('_hidden_params') or {}
+            if isinstance(hidden, dict):
+                cost = hidden.get('response_cost')
+                if cost is not None:
+                    v = float(cost)
+                    return v if math.isfinite(v) else None
+            return None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _extract_tokens(response):
+        """Extract (input_tokens, output_tokens) from a LangChain LLMResult."""
+        try:
+            if response is None:
+                return None, None
+            llm_out = getattr(response, 'llm_output', None) or {}
+            tu = llm_out.get('token_usage') if isinstance(llm_out, dict) else None
+            if tu:
+                # Prefer the first populated value: a canonical key present but
+                # None must not shadow a populated alias in the same dict.
+                inp = tu.get('prompt_tokens')
+                if inp is None:
+                    inp = tu.get('input_tokens')
+                out = tu.get('completion_tokens')
+                if out is None:
+                    out = tu.get('output_tokens')
+                if inp is not None or out is not None:
+                    return inp, out
+            generations = getattr(response, 'generations', None) or []
+            for gen_list in generations:
+                for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                    msg = getattr(gen, 'message', None)
+                    if msg is None:
+                        continue
+                    usage = getattr(msg, 'usage_metadata', None)
+                    if usage and isinstance(usage, dict):
+                        inp = usage.get('input_tokens')
+                        if inp is None:
+                            inp = usage.get('prompt_tokens')
+                        out = usage.get('output_tokens')
+                        if out is None:
+                            out = usage.get('completion_tokens')
+                        if inp is not None or out is not None:
+                            return inp, out
+            return None, None
+        except Exception:
+            return None, None
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         key = str(run_id)

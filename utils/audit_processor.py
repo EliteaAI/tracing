@@ -320,6 +320,23 @@ class AuditSpanProcessor:
         )
         duration_ms = attrs.get("audit.duration_ms")
 
+        raw_in = attrs.get("audit.input_tokens")
+        raw_out = attrs.get("audit.output_tokens")
+        try:
+            input_tokens = int(raw_in) if raw_in is not None else None
+        except (ValueError, TypeError):
+            input_tokens = None
+        try:
+            output_tokens = int(raw_out) if raw_out is not None else None
+        except (ValueError, TypeError):
+            output_tokens = None
+
+        raw_cost = attrs.get("audit.llm_cost")
+        try:
+            llm_cost = float(raw_cost) if raw_cost is not None else None
+        except (ValueError, TypeError):
+            llm_cost = None
+
         return self._build_event(
             snap=snap,
             attrs=attrs,
@@ -328,6 +345,9 @@ class AuditSpanProcessor:
             model_name=model_name,
             duration_ms=float(duration_ms) if duration_ms is not None else None,
             is_error=bool(attrs.get("audit.is_error", False)),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            llm_cost=llm_cost,
         )
 
     # --- Event builder (runs on worker thread — blocking RPC is fine) ---
@@ -402,7 +422,8 @@ class AuditSpanProcessor:
 
         # Add optional fields
         for key in ("http_method", "http_route", "status_code", "duration_ms",
-                     "tool_name", "model_name"):
+                     "tool_name", "model_name", "input_tokens", "output_tokens",
+                     "llm_cost"):
             if key in extra and extra[key] is not None:
                 event[key] = extra[key]
 
