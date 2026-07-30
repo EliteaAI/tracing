@@ -391,3 +391,51 @@ def test_cost_observed_wins_over_estimated():
     event = proc._extract_llm(snap, snap["attrs"])
     assert abs(event.get("llm_cost", 0) - 0.00099) < 1e-10, event
     assert event.get("cost_source") == "observed", event
+
+
+def test_openai_bypass_cache_tokens_subtracted_from_prompt():
+    """OpenAI-bypass shape: prompt_tokens is inclusive of cached tokens.
+
+    Regression for the double-count bug: without normalization the cached
+    portion is charged twice — once at input_price via prompt_tokens, once
+    at cache_read_price via input_cached_tokens.
+    """
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "gpt-4o",
+        # OpenAI shape: prompt_tokens=1000 INCLUDES 500 cached tokens
+        "langfuse.observation.usage_details": json.dumps({
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "total_tokens": 1500,
+            "input_cached_tokens": 500,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    # gpt-4o v1.83.14-stable: input 2.5e-6, output 1e-5, cache_read 1.25e-6
+    # Correct: 500 fresh input * 2.5e-6 + 500 out * 1e-5 + 500 cached * 1.25e-6
+    #        = 0.00125 + 0.005 + 0.000625 = 0.006875
+    # Without normalization (bug): 1000 * 2.5e-6 + 500 * 1e-5 + 500 * 1.25e-6
+    #                           = 0.0025 + 0.005 + 0.000625 = 0.008125
+    expected = 500 * 2.5e-6 + 500 * 1e-5 + 500 * 1.25e-6
+    assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
+
+
+def test_langfuse_normalized_shape_no_cache_double_subtract():
+    """Anthropic-normalized shape: 'input' is already net-of-cache — do NOT subtract again."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "langfuse.observation.usage_details": json.dumps({
+            # Anthropic shape: "input"=800 is ALREADY net of the 200 cache_read
+            "input": 800,
+            "output": 200,
+            "input_cache_read_input_tokens": 200,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    # v1.83.14-stable: input 3e-6, output 1.5e-5, cache_read 3e-7
+    expected = 800 * 3e-6 + 200 * 1.5e-5 + 200 * 3e-7
+    assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event

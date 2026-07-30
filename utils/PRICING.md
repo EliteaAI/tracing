@@ -55,13 +55,15 @@ regression test with a known model that has those keys.
 ## Known biases
 
 - **Cache token accounting convention.** `compute_llm_cost()` treats
-  `input_tokens` as already-net-of-cache. This is correct for Langfuse's
-  normalized shape (where `"input"` excludes cache-read tokens). It is a
-  slight over-count for the OpenAI-bypass shape (where `prompt_tokens`
-  includes cached tokens): those cached tokens are billed at the full input
-  rate rather than the cache-read discount rate. Not a large bias in
-  practice — cache-heavy Anthropic workloads route through the normalized
-  shape where this is correct — but flagged here for auditability.
+  `input_tokens` as already-net-of-cache. `_extract_llm` normalizes both
+  provider shapes to this contract before calling: Langfuse's normalized
+  shape (Anthropic / Vertex / Bedrock / Ollama) already excludes cache
+  from `"input"` so no adjustment; the OpenAI-bypass shape's
+  `prompt_tokens` is subtracted before pricing to avoid double-charging
+  cached tokens at both the base input rate and the cache-read rate. If
+  a future upstream ever emits a shape that is neither, cost will
+  slightly over-count the cached portion (base rate applied). Guarded
+  by regression tests in `test_audit_processor_tokens.py`.
 - **Tier boundaries not modeled** (see Scope above).
 
 ## What happens on an unknown model

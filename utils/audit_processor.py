@@ -102,6 +102,26 @@ def _pick_int(d, keys):
     return None
 
 
+def _pick_int_with_key(d, keys):
+    """Like ``_pick_int`` but also returns which key matched (or None, None).
+
+    Callers use the matched-key name to distinguish shape conventions —
+    e.g. OpenAI-bypass ``prompt_tokens`` is inclusive of cached tokens
+    while Langfuse-normalized ``input`` is already net of them.
+    """
+    if not d:
+        return None, None
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v), k
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
 _unknown_cost_keys_seen = set()  # dedupe per-key WARN logs
 
 
@@ -429,10 +449,25 @@ class AuditSpanProcessor:
             attrs.get("langfuse.observation.cost_details")
         )
 
-        input_tokens = _pick_int(usage_dict, _LANGFUSE_INPUT_KEYS)
+        input_tokens, input_key = _pick_int_with_key(usage_dict, _LANGFUSE_INPUT_KEYS)
         output_tokens = _pick_int(usage_dict, _LANGFUSE_OUTPUT_KEYS)
         cache_read_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_READ_KEYS) or 0
         cache_creation_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
+
+        # Normalize input_tokens to net-of-cache convention that
+        # compute_llm_cost expects. Langfuse's normalized shape (Anthropic,
+        # Vertex, Bedrock, Ollama) already excludes cache tokens from
+        # "input", so no adjustment. The OpenAI-bypass shape keeps
+        # prompt_tokens inclusive of cached tokens — subtract to avoid
+        # double-charging (once at base input_price via input_tokens, once
+        # at cache_read_price via cache_read_tokens).
+        if input_tokens is not None and input_key == "prompt_tokens" and (
+            cache_read_tokens or cache_creation_tokens
+        ):
+            input_tokens = max(
+                0, input_tokens - cache_read_tokens - cache_creation_tokens
+            )
+
         llm_cost = _pick_cost(cost_dict)
         token_source = "langfuse" if (
             input_tokens is not None or output_tokens is not None
