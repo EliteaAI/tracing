@@ -283,6 +283,27 @@ def test_langfuse_cost_details_breakdown_allowlist():
     assert event.get("cost_source") == "observed", event
 
 
+def test_langfuse_cost_details_total_null_falls_through_to_breakdown():
+    """Real Langfuse payloads sometimes carry {"total": null, "input": ..., "output": ...}.
+
+    Prior behavior treated the null as a parse failure and returned None,
+    triggering a spurious cost estimate. The breakdown must be used instead.
+    """
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.usage_details": json.dumps({"input": 100, "output": 50}),
+        "langfuse.observation.cost_details": json.dumps({
+            "total": None,
+            "input": 0.001,
+            "output": 0.002,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert abs(event.get("llm_cost", 0) - 0.003) < 1e-10, event
+    assert event.get("cost_source") == "observed", event
+
+
 # --- Cost estimation from vendored LiteLLM pricing (ADR-0008 Phase B) ---
 
 

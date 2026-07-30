@@ -108,20 +108,26 @@ _unknown_cost_keys_seen = set()  # dedupe per-key WARN logs
 def _pick_cost(cost_dict):
     """Extract a scalar USD cost from a Langfuse cost_details dict.
 
-    Prefers a ``total`` key; otherwise sums values under keys in
-    ``_ALLOWED_COST_KEYS``. Unknown keys are dropped (with a one-shot WARN)
-    to guard against silent inflation on Langfuse schema drift.
+    Prefers a ``total`` key when it holds a valid number; otherwise sums
+    values under keys in ``_ALLOWED_COST_KEYS``. Unknown keys are dropped
+    (with a one-shot WARN) to guard against silent inflation on Langfuse
+    schema drift.
     """
     if not cost_dict:
         return None
-    if "total" in cost_dict:
+    total_raw = cost_dict.get("total")
+    if total_raw is not None:
         try:
-            return float(cost_dict["total"])
+            return float(total_raw)
         except (TypeError, ValueError):
-            return None
+            # Fall through to the breakdown-sum path — real payloads
+            # occasionally carry {"total": null, "input": X, "output": Y}.
+            pass
     total = 0.0
     saw_number = False
     for k, v in cost_dict.items():
+        if k == "total":
+            continue
         if k not in _ALLOWED_COST_KEYS:
             if k not in _unknown_cost_keys_seen:
                 _unknown_cost_keys_seen.add(k)
