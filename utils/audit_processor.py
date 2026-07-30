@@ -425,6 +425,8 @@ class AuditSpanProcessor:
 
         input_tokens = _pick_int(usage_dict, _LANGFUSE_INPUT_KEYS)
         output_tokens = _pick_int(usage_dict, _LANGFUSE_OUTPUT_KEYS)
+        cache_read_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_READ_KEYS) or 0
+        cache_creation_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
         llm_cost = _pick_cost(cost_dict)
         token_source = "langfuse" if (
             input_tokens is not None or output_tokens is not None
@@ -457,6 +459,20 @@ class AuditSpanProcessor:
                 llm_cost = None
 
         cost_source = "observed" if llm_cost is not None else None
+        # 3) If neither namespace supplied a cost, estimate from tokens against
+        #    the vendored LiteLLM pricing table. Cached models used to charge
+        #    nothing under Langfuse-server-side costing today; this fills that
+        #    gap for the non-Langfuse env.
+        if llm_cost is None:
+            try:
+                from .model_pricing import compute_llm_cost
+                llm_cost, cost_source = compute_llm_cost(
+                    model_name, input_tokens, output_tokens,
+                    cache_read_input_tokens=cache_read_tokens,
+                    cache_creation_input_tokens=cache_creation_tokens,
+                )
+            except Exception as e:
+                log.debug("audit: cost estimation failed: %s", e)
 
         return self._build_event(
             snap=snap,

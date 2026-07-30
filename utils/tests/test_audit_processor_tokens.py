@@ -46,10 +46,27 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 # Inject resolve_user_email directly before exec
 _mod.resolve_user_email = lambda user_id: None
-# Patch the relative import by pre-populating the source
+# Load the real model_pricing module (from the tracing utils directory) and
+# inject its compute_llm_cost so the relative import inside _extract_llm
+# resolves without needing the tracing package on sys.path.
+_mp_spec = importlib.util.spec_from_file_location(
+    "model_pricing", str(_utils_dir / "model_pricing.py"),
+)
+_mp_mod = importlib.util.module_from_spec(_mp_spec)
+_mp_spec.loader.exec_module(_mp_mod)
+sys.modules["model_pricing"] = _mp_mod
+
+# Patch the relative imports by rewriting the source before compile+exec:
+# audit_processor.py uses "from .user_context import ..." (module-scope) and
+# "from .model_pricing import ..." (inside _extract_llm). We turn the second
+# into an absolute import against our sys.modules stub.
 import types as _t
 _source = (_utils_dir / "audit_processor.py").read_text()
 _source = _source.replace("from .user_context import resolve_user_email", "")
+_source = _source.replace(
+    "from .model_pricing import compute_llm_cost",
+    "from model_pricing import compute_llm_cost",
+)
 exec(compile(_source, str(_utils_dir / "audit_processor.py"), "exec"), _mod.__dict__)
 sys.modules["audit_processor"] = _mod
 
@@ -190,8 +207,10 @@ def test_langfuse_openai_bypass_shape():
     assert event.get("input_tokens") == 200, event
     assert event.get("output_tokens") == 80, event
     assert event.get("token_source") == "langfuse", event
-    # No cost_details attribute → llm_cost stays None
-    assert event.get("llm_cost") is None, event
+    # No cost_details on span, but pricing table kicks in for gpt-4o.
+    expected = 200 * 2.5e-6 + 80 * 1.0e-5
+    assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
+    assert event.get("cost_source", "").startswith("estimated:"), event
 
 
 def test_langfuse_only_no_audit_attrs():
@@ -261,4 +280,93 @@ def test_langfuse_cost_details_breakdown_allowlist():
     })
     event = proc._extract_llm(snap, snap["attrs"])
     assert abs(event.get("llm_cost", 0) - 0.003) < 1e-10, event
+    assert event.get("cost_source") == "observed", event
+
+
+# --- Cost estimation from vendored LiteLLM pricing (ADR-0008 Phase B) ---
+
+
+def test_cost_estimated_gpt4o():
+    """gpt-4o with known token counts: cost computed from pricing table."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "gpt-4o",
+        "langfuse.observation.usage_details": json.dumps({
+            "prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500,
+        }),
+        # No cost_details on the span — must fall through to estimation.
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    # gpt-4o v1.83.14: input $2.5e-6/token, output $1.0e-5/token
+    expected = 1000 * 2.5e-6 + 500 * 1.0e-5
+    assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
+    assert event.get("cost_source", "").startswith("estimated:litellm-"), event
+
+
+def test_cost_estimated_claude_with_cache_read():
+    """Anthropic claude cache-read tokens priced at their own rate."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "langfuse.observation.usage_details": json.dumps({
+            # Langfuse normalized shape decrements cache tokens from input.
+            "input": 800,
+            "output": 200,
+            "input_cache_read_input_tokens": 200,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    # us.anthropic.claude-3-5-sonnet-20241022-v2:0 v1.83.14-stable:
+    #   input 3e-6, output 1.5e-5, cache_read_input_token_cost 3e-7
+    # Langfuse's "input"=800 is already net-of-cache; compute_llm_cost takes
+    # it as-is, then adds cache_read_input_tokens separately.
+    expected = 800 * 3e-6 + 200 * 1.5e-5 + 200 * 3e-7
+    assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
+    assert event.get("cost_source", "").startswith("estimated:"), event
+
+
+def test_cost_bedrock_prefix_stripped():
+    """Bedrock inference-profile IDs (with us./eu./ prefixes) resolve to a price."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "langfuse.observation.usage_details": json.dumps({
+            "input": 1000, "output": 500,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("llm_cost") is not None, event
+    assert event.get("cost_source", "").startswith("estimated:"), event
+
+
+def test_cost_unknown_model_stays_null():
+    """Nonsense model name: llm_cost/cost_source both remain None."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "definitely-not-a-real-model-xyz-999",
+        "langfuse.observation.usage_details": json.dumps({
+            "input": 100, "output": 50,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("llm_cost") is None, event
+    assert event.get("cost_source") is None, event
+
+
+def test_cost_observed_wins_over_estimated():
+    """When audit.llm_cost is set, cost_source stays 'observed'."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "audit.observation.type": "generation",
+        "audit.model.name": "gpt-4o",
+        "audit.input_tokens": 1000,
+        "audit.output_tokens": 500,
+        "audit.llm_cost": 0.00099,  # explicit observed cost
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert abs(event.get("llm_cost", 0) - 0.00099) < 1e-10, event
     assert event.get("cost_source") == "observed", event
