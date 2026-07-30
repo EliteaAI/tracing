@@ -19,6 +19,7 @@ Supports spans from:
 - AuditLangChainCallback spans (audit.observation.type)
 """
 
+import json
 import threading
 from queue import SimpleQueue
 
@@ -40,6 +41,98 @@ _DEFAULT_SKIP_PATHS = frozenset([
 
 # Sentinel to signal the worker to stop
 _STOP = object()
+
+
+# Langfuse's LangChain CallbackHandler emits usage/cost as JSON-serialized dicts
+# under langfuse.observation.usage_details / .cost_details. Key shapes vary by
+# provider — OpenAI keeps prompt_tokens/completion_tokens verbatim, everything
+# else is normalized to input/output/total. See langfuse.langchain.CallbackHandler.
+_LANGFUSE_INPUT_KEYS = ("input", "prompt_tokens", "input_tokens")
+_LANGFUSE_OUTPUT_KEYS = ("output", "completion_tokens", "output_tokens")
+_LANGFUSE_CACHE_READ_KEYS = (
+    "input_cached_tokens",              # OpenAI-bypass shape
+    "input_cache_read_input_tokens",    # Anthropic normalized shape
+    "cache_read_input_tokens",
+)
+_LANGFUSE_CACHE_CREATE_KEYS = (
+    "input_cache_creation_input_tokens",
+    "cache_creation_input_tokens",
+)
+# Cost-detail keys we know how to sum. Any other key is dropped with a warning
+# so future Langfuse schema drift can't silently inflate totals.
+_ALLOWED_COST_KEYS = frozenset((
+    "input", "output", "total",
+    "cache_read_input", "cache_creation_input", "cache_read", "reasoning",
+))
+
+
+def _parse_langfuse_json_attr(raw):
+    """Decode a langfuse.observation.* JSON-string attribute value.
+
+    Langfuse serializes dicts via json.dumps before setting them on the OTEL
+    span. Returns None on any parse failure so the caller can silently fall
+    back to the audit.* namespace.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        log.debug("audit: langfuse observation attr parse failed")
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _pick_int(d, keys):
+    """Return the first int-coercible value under any of ``keys``, else None."""
+    if not d:
+        return None
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+_unknown_cost_keys_seen = set()  # dedupe per-key WARN logs
+
+
+def _pick_cost(cost_dict):
+    """Extract a scalar USD cost from a Langfuse cost_details dict.
+
+    Prefers a ``total`` key; otherwise sums values under keys in
+    ``_ALLOWED_COST_KEYS``. Unknown keys are dropped (with a one-shot WARN)
+    to guard against silent inflation on Langfuse schema drift.
+    """
+    if not cost_dict:
+        return None
+    if "total" in cost_dict:
+        try:
+            return float(cost_dict["total"])
+        except (TypeError, ValueError):
+            return None
+    total = 0.0
+    saw_number = False
+    for k, v in cost_dict.items():
+        if k not in _ALLOWED_COST_KEYS:
+            if k not in _unknown_cost_keys_seen:
+                _unknown_cost_keys_seen.add(k)
+                log.warning("audit: unknown cost_details key ignored: %s", k)
+            continue
+        try:
+            total += float(v)
+            saw_number = True
+        except (TypeError, ValueError):
+            continue
+    return total if saw_number else None
 
 
 class AuditSpanProcessor:
@@ -320,22 +413,50 @@ class AuditSpanProcessor:
         )
         duration_ms = attrs.get("audit.duration_ms")
 
-        raw_in = attrs.get("audit.input_tokens")
-        raw_out = attrs.get("audit.output_tokens")
-        try:
-            input_tokens = int(raw_in) if raw_in is not None else None
-        except (ValueError, TypeError):
-            input_tokens = None
-        try:
-            output_tokens = int(raw_out) if raw_out is not None else None
-        except (ValueError, TypeError):
-            output_tokens = None
+        # 1) Langfuse namespace (primary path in production — CallbackHandler
+        #    emits usage_details / cost_details as JSON strings on every
+        #    generation span). Silently falls through on any parse failure.
+        usage_dict = _parse_langfuse_json_attr(
+            attrs.get("langfuse.observation.usage_details")
+        )
+        cost_dict = _parse_langfuse_json_attr(
+            attrs.get("langfuse.observation.cost_details")
+        )
 
-        raw_cost = attrs.get("audit.llm_cost")
-        try:
-            llm_cost = float(raw_cost) if raw_cost is not None else None
-        except (ValueError, TypeError):
-            llm_cost = None
+        input_tokens = _pick_int(usage_dict, _LANGFUSE_INPUT_KEYS)
+        output_tokens = _pick_int(usage_dict, _LANGFUSE_OUTPUT_KEYS)
+        llm_cost = _pick_cost(cost_dict)
+        token_source = "langfuse" if (
+            input_tokens is not None or output_tokens is not None
+        ) else None
+
+        # 2) audit.* namespace — populated by AuditLangChainCallback when
+        #    Langfuse credentials are absent. Fills in whichever fields the
+        #    Langfuse path didn't already produce.
+        if input_tokens is None:
+            raw_in = attrs.get("audit.input_tokens")
+            try:
+                input_tokens = int(raw_in) if raw_in is not None else None
+                if input_tokens is not None and token_source is None:
+                    token_source = "audit"
+            except (ValueError, TypeError):
+                input_tokens = None
+        if output_tokens is None:
+            raw_out = attrs.get("audit.output_tokens")
+            try:
+                output_tokens = int(raw_out) if raw_out is not None else None
+                if output_tokens is not None and token_source is None:
+                    token_source = "audit"
+            except (ValueError, TypeError):
+                output_tokens = None
+        if llm_cost is None:
+            raw_cost = attrs.get("audit.llm_cost")
+            try:
+                llm_cost = float(raw_cost) if raw_cost is not None else None
+            except (ValueError, TypeError):
+                llm_cost = None
+
+        cost_source = "observed" if llm_cost is not None else None
 
         return self._build_event(
             snap=snap,
@@ -348,6 +469,8 @@ class AuditSpanProcessor:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             llm_cost=llm_cost,
+            token_source=token_source,
+            cost_source=cost_source,
         )
 
     # --- Event builder (runs on worker thread — blocking RPC is fine) ---
@@ -423,7 +546,7 @@ class AuditSpanProcessor:
         # Add optional fields
         for key in ("http_method", "http_route", "status_code", "duration_ms",
                      "tool_name", "model_name", "input_tokens", "output_tokens",
-                     "llm_cost"):
+                     "llm_cost", "token_source", "cost_source"):
             if key in extra and extra[key] is not None:
                 event[key] = extra[key]
 

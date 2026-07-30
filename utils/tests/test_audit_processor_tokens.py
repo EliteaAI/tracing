@@ -5,6 +5,7 @@ Run standalone:
     cd tracing && python3 -m pytest utils/tests/test_audit_processor_tokens.py -v --rootdir=utils/tests
 """
 
+import json
 import sys
 import types
 import pathlib
@@ -149,3 +150,115 @@ def test_extract_llm_non_numeric_string_graceful():
     assert event is not None
     assert event.get("input_tokens") is None, event
     assert event.get("output_tokens") is None, event
+
+
+# --- Langfuse-namespace reader (ADR-0008 Phase A) ---
+
+
+def test_langfuse_normalized_shape():
+    """Anthropic/Vertex/Bedrock/Ollama shape after Langfuse normalization."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "claude-3-5-sonnet",
+        "langfuse.observation.usage_details": json.dumps(
+            {"input": 150, "output": 60, "total": 210}
+        ),
+        "langfuse.observation.cost_details": json.dumps({"total": 0.00123456}),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("input_tokens") == 150, event
+    assert event.get("output_tokens") == 60, event
+    assert abs(event.get("llm_cost", 0) - 0.00123456) < 1e-10, event
+    assert event.get("token_source") == "langfuse", event
+    assert event.get("cost_source") == "observed", event
+
+
+def test_langfuse_openai_bypass_shape():
+    """OpenAI/LiteLLM bypass shape — prompt_tokens/completion_tokens preserved."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "gpt-4o",
+        "langfuse.observation.usage_details": json.dumps({
+            "prompt_tokens": 200,
+            "completion_tokens": 80,
+            "total_tokens": 280,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("input_tokens") == 200, event
+    assert event.get("output_tokens") == 80, event
+    assert event.get("token_source") == "langfuse", event
+    # No cost_details attribute → llm_cost stays None
+    assert event.get("llm_cost") is None, event
+
+
+def test_langfuse_only_no_audit_attrs():
+    """Regression: real production shape when Langfuse is configured.
+
+    audit.* keys are entirely absent — only langfuse.observation.* present.
+    """
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": "gpt-4o-mini",
+        "langfuse.observation.usage_details": json.dumps({
+            "input": 42, "output": 8, "total": 50,
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("input_tokens") == 42, event
+    assert event.get("output_tokens") == 8, event
+    assert event.get("token_source") == "langfuse", event
+
+
+def test_langfuse_malformed_json_falls_back_to_audit():
+    """Broken JSON on the Langfuse attr must not crash — fall back to audit.*."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "audit.observation.type": "generation",
+        "audit.model.name": "gpt-4o",
+        "audit.input_tokens": 150,
+        "audit.output_tokens": 60,
+        # Not valid JSON — parser must return None and skip this namespace.
+        "langfuse.observation.usage_details": "this is not json {{{",
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("input_tokens") == 150, event
+    assert event.get("output_tokens") == 60, event
+    assert event.get("token_source") == "audit", event
+
+
+def test_langfuse_wins_over_audit_when_both_present():
+    """When both namespaces are populated, Langfuse takes precedence."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.usage_details": json.dumps(
+            {"input": 999, "output": 888}
+        ),
+        "audit.input_tokens": 111,
+        "audit.output_tokens": 222,
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert event.get("input_tokens") == 999, event
+    assert event.get("output_tokens") == 888, event
+    assert event.get("token_source") == "langfuse", event
+
+
+def test_langfuse_cost_details_breakdown_allowlist():
+    """cost_details without a total: sum only known keys; unknown keys dropped."""
+    proc, _ = _make_processor()
+    snap = _make_snap({
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.usage_details": json.dumps({"input": 100, "output": 50}),
+        "langfuse.observation.cost_details": json.dumps({
+            "input": 0.001,
+            "output": 0.002,
+            "unknown_future_key": 999.0,  # must be ignored
+        }),
+    })
+    event = proc._extract_llm(snap, snap["attrs"])
+    assert abs(event.get("llm_cost", 0) - 0.003) < 1e-10, event
+    assert event.get("cost_source") == "observed", event
