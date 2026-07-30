@@ -27,6 +27,13 @@ except ImportError:
     _API_TOOLS_IMPORTABLE = False
 
 
+# Dedup set for _write_audit_event's swallowed-exception WARN log — repeated
+# failures with the same error string only WARN once per process, then drop
+# to DEBUG. Prevents log spam during a schema-mismatch deploy window while
+# still surfacing the first occurrence.
+_audit_write_errors_seen = set()
+
+
 class Module(module.ModuleModel):
     """Tracing plugin for distributed request tracing."""
 
@@ -1095,7 +1102,20 @@ class Module(module.ModuleModel):
             finally:
                 db_support.close_local_session()
         except Exception as e:
-            log.debug(f"Failed to write audit event: {e}")
+            # Escalated from debug to warning after a round-3 review found
+            # this line was masking silent full-row loss on schema-mismatch
+            # deploys (e.g. tracing PR landed before the elitea_core admin
+            # task added token_source/cost_source columns). Dedup per unique
+            # error message so a schema-drift storm doesn't spam the log.
+            key = str(e)[:200]
+            if key not in _audit_write_errors_seen:
+                _audit_write_errors_seen.add(key)
+                log.warning(
+                    "audit: failed to write audit event (schema mismatch?): %s",
+                    e,
+                )
+            else:
+                log.debug("audit: repeat write failure: %s", e)
 
     def _forward_audit_event(self, data):
         """Forward an audit event dict via EventNode (pylon_indexer forwarder mode)."""

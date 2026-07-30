@@ -393,12 +393,14 @@ def test_cost_observed_wins_over_estimated():
     assert event.get("cost_source") == "observed", event
 
 
-def test_openai_bypass_cache_tokens_subtracted_from_prompt():
+def test_openai_bypass_cache_tokens_priced_correctly_but_input_preserved():
     """OpenAI-bypass shape: prompt_tokens is inclusive of cached tokens.
 
-    Regression for the double-count bug: without normalization the cached
-    portion is charged twice — once at input_price via prompt_tokens, once
-    at cache_read_price via input_cached_tokens.
+    Two things must hold:
+    - Persisted input_tokens equals RAW prompt_tokens (1000), so the
+      analytics UI shows what the user actually sent.
+    - llm_cost is estimated on the NET-of-cache count so cached tokens
+      aren't double-charged (base rate + cache_read rate).
     """
     proc, _ = _make_processor()
     snap = _make_snap({
@@ -413,11 +415,12 @@ def test_openai_bypass_cache_tokens_subtracted_from_prompt():
         }),
     })
     event = proc._extract_llm(snap, snap["attrs"])
+    # PERSISTED value: raw prompt_tokens count, not net-of-cache.
+    assert event.get("input_tokens") == 1000, event
+    assert event.get("output_tokens") == 500, event
+    # COST: computed on 500 net-of-cache input + 500 cache_read at
+    # gpt-4o's cache_read rate, plus 500 output.
     # gpt-4o v1.83.14-stable: input 2.5e-6, output 1e-5, cache_read 1.25e-6
-    # Correct: 500 fresh input * 2.5e-6 + 500 out * 1e-5 + 500 cached * 1.25e-6
-    #        = 0.00125 + 0.005 + 0.000625 = 0.006875
-    # Without normalization (bug): 1000 * 2.5e-6 + 500 * 1e-5 + 500 * 1.25e-6
-    #                           = 0.0025 + 0.005 + 0.000625 = 0.008125
     expected = 500 * 2.5e-6 + 500 * 1e-5 + 500 * 1.25e-6
     assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
 

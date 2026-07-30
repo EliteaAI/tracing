@@ -454,19 +454,25 @@ class AuditSpanProcessor:
         cache_read_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_READ_KEYS) or 0
         cache_creation_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
 
-        # Normalize input_tokens to net-of-cache convention that
-        # compute_llm_cost expects. Langfuse's normalized shape (Anthropic,
-        # Vertex, Bedrock, Ollama) already excludes cache tokens from
-        # "input", so no adjustment. The OpenAI-bypass shape keeps
-        # prompt_tokens inclusive of cached tokens — subtract to avoid
-        # double-charging (once at base input_price via input_tokens, once
-        # at cache_read_price via cache_read_tokens).
+        # Compute the net-of-cache value used ONLY for cost estimation.
+        # compute_llm_cost expects an input count that is already exclusive
+        # of cache tokens. Langfuse's normalized shape (Anthropic, Vertex,
+        # Bedrock, Ollama) already emits "input" net of cache, so this is
+        # a passthrough. The OpenAI-bypass shape keeps prompt_tokens
+        # inclusive of cached tokens — subtract before pricing to avoid
+        # double-charging (once at base input_price, once at cache_read_price).
+        # Do NOT mutate input_tokens: the raw prompt/input count is what
+        # gets persisted to audit_events.input_tokens and rendered in the
+        # analytics UI's "Input tokens" KPI. Subtracting there would make
+        # the KPI silently under-report cache-heavy OpenAI workloads.
         if input_tokens is not None and input_key == "prompt_tokens" and (
             cache_read_tokens or cache_creation_tokens
         ):
-            input_tokens = max(
+            billable_input_tokens = max(
                 0, input_tokens - cache_read_tokens - cache_creation_tokens
             )
+        else:
+            billable_input_tokens = input_tokens
 
         llm_cost = _pick_cost(cost_dict)
         token_source = "langfuse" if (
@@ -508,7 +514,7 @@ class AuditSpanProcessor:
             try:
                 from .model_pricing import compute_llm_cost
                 llm_cost, cost_source = compute_llm_cost(
-                    model_name, input_tokens, output_tokens,
+                    model_name, billable_input_tokens, output_tokens,
                     cache_read_input_tokens=cache_read_tokens,
                     cache_creation_input_tokens=cache_creation_tokens,
                 )
