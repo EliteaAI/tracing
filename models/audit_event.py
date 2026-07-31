@@ -61,6 +61,15 @@ class AuditEvent(db.Base):
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     llm_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8), nullable=True)
 
+    # Provenance stamps written by AuditSpanProcessor._extract_llm.
+    # Kept in this ORM class explicitly because module._write_audit_event
+    # filters the event dict with `hasattr(AuditEvent, k)` — a field the
+    # class doesn't declare is silently dropped before INSERT.
+    # cost_source(64) coordinates with elitea_core's schema-guard width
+    # so future '-stable.patch.N' pricing-table tags don't overflow.
+    token_source: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    cost_source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     # Trace linkage
     trace_id: Mapped[str] = mapped_column(String(32), nullable=True)
     span_id: Mapped[str] = mapped_column(String(16), nullable=True)

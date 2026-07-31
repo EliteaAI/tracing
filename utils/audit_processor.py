@@ -19,6 +19,7 @@ Supports spans from:
 - AuditLangChainCallback spans (audit.observation.type)
 """
 
+import json
 import threading
 from queue import SimpleQueue
 
@@ -40,6 +41,124 @@ _DEFAULT_SKIP_PATHS = frozenset([
 
 # Sentinel to signal the worker to stop
 _STOP = object()
+
+
+# Langfuse's LangChain CallbackHandler emits usage/cost as JSON-serialized dicts
+# under langfuse.observation.usage_details / .cost_details. Key shapes vary by
+# provider — OpenAI keeps prompt_tokens/completion_tokens verbatim, everything
+# else is normalized to input/output/total. See langfuse.langchain.CallbackHandler.
+_LANGFUSE_INPUT_KEYS = ("input", "prompt_tokens", "input_tokens")
+_LANGFUSE_OUTPUT_KEYS = ("output", "completion_tokens", "output_tokens")
+_LANGFUSE_CACHE_READ_KEYS = (
+    "input_cached_tokens",              # OpenAI-bypass shape
+    "input_cache_read_input_tokens",    # Anthropic normalized shape
+    "cache_read_input_tokens",
+)
+_LANGFUSE_CACHE_CREATE_KEYS = (
+    "input_cache_creation_input_tokens",
+    "cache_creation_input_tokens",
+)
+# Cost-detail keys we know how to sum. Any other key is dropped with a warning
+# so future Langfuse schema drift can't silently inflate totals.
+_ALLOWED_COST_KEYS = frozenset((
+    "input", "output", "total",
+    "cache_read_input", "cache_creation_input", "cache_read", "reasoning",
+))
+
+
+def _parse_langfuse_json_attr(raw):
+    """Decode a langfuse.observation.* JSON-string attribute value.
+
+    Langfuse serializes dicts via json.dumps before setting them on the OTEL
+    span. Returns None on any parse failure so the caller can silently fall
+    back to the audit.* namespace.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        log.debug("audit: langfuse observation attr parse failed")
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _pick_int(d, keys):
+    """Return the first int-coercible value under any of ``keys``, else None."""
+    if not d:
+        return None
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _pick_int_with_key(d, keys):
+    """Like ``_pick_int`` but also returns which key matched (or None, None).
+
+    Callers use the matched-key name to distinguish shape conventions —
+    e.g. OpenAI-bypass ``prompt_tokens`` is inclusive of cached tokens
+    while Langfuse-normalized ``input`` is already net of them.
+    """
+    if not d:
+        return None, None
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v), k
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
+_unknown_cost_keys_seen = set()  # dedupe per-key WARN logs
+
+
+def _pick_cost(cost_dict):
+    """Extract a scalar USD cost from a Langfuse cost_details dict.
+
+    Prefers a ``total`` key when it holds a valid number; otherwise sums
+    values under keys in ``_ALLOWED_COST_KEYS``. Unknown keys are dropped
+    (with a one-shot WARN) to guard against silent inflation on Langfuse
+    schema drift.
+    """
+    if not cost_dict:
+        return None
+    total_raw = cost_dict.get("total")
+    if total_raw is not None:
+        try:
+            return float(total_raw)
+        except (TypeError, ValueError):
+            # Fall through to the breakdown-sum path — real payloads
+            # occasionally carry {"total": null, "input": X, "output": Y}.
+            pass
+    total = 0.0
+    saw_number = False
+    for k, v in cost_dict.items():
+        if k == "total":
+            continue
+        if k not in _ALLOWED_COST_KEYS:
+            if k not in _unknown_cost_keys_seen:
+                _unknown_cost_keys_seen.add(k)
+                log.warning("audit: unknown cost_details key ignored: %s", k)
+            continue
+        try:
+            total += float(v)
+            saw_number = True
+        except (TypeError, ValueError):
+            continue
+    return total if saw_number else None
 
 
 class AuditSpanProcessor:
@@ -320,22 +439,87 @@ class AuditSpanProcessor:
         )
         duration_ms = attrs.get("audit.duration_ms")
 
-        raw_in = attrs.get("audit.input_tokens")
-        raw_out = attrs.get("audit.output_tokens")
-        try:
-            input_tokens = int(raw_in) if raw_in is not None else None
-        except (ValueError, TypeError):
-            input_tokens = None
-        try:
-            output_tokens = int(raw_out) if raw_out is not None else None
-        except (ValueError, TypeError):
-            output_tokens = None
+        # 1) Langfuse namespace (primary path in production — CallbackHandler
+        #    emits usage_details / cost_details as JSON strings on every
+        #    generation span). Silently falls through on any parse failure.
+        usage_dict = _parse_langfuse_json_attr(
+            attrs.get("langfuse.observation.usage_details")
+        )
+        cost_dict = _parse_langfuse_json_attr(
+            attrs.get("langfuse.observation.cost_details")
+        )
 
-        raw_cost = attrs.get("audit.llm_cost")
-        try:
-            llm_cost = float(raw_cost) if raw_cost is not None else None
-        except (ValueError, TypeError):
-            llm_cost = None
+        input_tokens, input_key = _pick_int_with_key(usage_dict, _LANGFUSE_INPUT_KEYS)
+        output_tokens = _pick_int(usage_dict, _LANGFUSE_OUTPUT_KEYS)
+        cache_read_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_READ_KEYS) or 0
+        cache_creation_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
+
+        # Compute the net-of-cache value used ONLY for cost estimation.
+        # compute_llm_cost expects an input count that is already exclusive
+        # of cache tokens. Langfuse's normalized shape (Anthropic, Vertex,
+        # Bedrock, Ollama) already emits "input" net of cache, so this is
+        # a passthrough. The OpenAI-bypass shape keeps prompt_tokens
+        # inclusive of cached tokens — subtract before pricing to avoid
+        # double-charging (once at base input_price, once at cache_read_price).
+        # Do NOT mutate input_tokens: the raw prompt/input count is what
+        # gets persisted to audit_events.input_tokens and rendered in the
+        # analytics UI's "Input tokens" KPI. Subtracting there would make
+        # the KPI silently under-report cache-heavy OpenAI workloads.
+        if input_tokens is not None and input_key == "prompt_tokens" and (
+            cache_read_tokens or cache_creation_tokens
+        ):
+            billable_input_tokens = max(
+                0, input_tokens - cache_read_tokens - cache_creation_tokens
+            )
+        else:
+            billable_input_tokens = input_tokens
+
+        llm_cost = _pick_cost(cost_dict)
+        token_source = "langfuse" if (
+            input_tokens is not None or output_tokens is not None
+        ) else None
+
+        # 2) audit.* namespace — populated by AuditLangChainCallback when
+        #    Langfuse credentials are absent. Fills in whichever fields the
+        #    Langfuse path didn't already produce.
+        if input_tokens is None:
+            raw_in = attrs.get("audit.input_tokens")
+            try:
+                input_tokens = int(raw_in) if raw_in is not None else None
+                if input_tokens is not None and token_source is None:
+                    token_source = "audit"
+            except (ValueError, TypeError):
+                input_tokens = None
+        if output_tokens is None:
+            raw_out = attrs.get("audit.output_tokens")
+            try:
+                output_tokens = int(raw_out) if raw_out is not None else None
+                if output_tokens is not None and token_source is None:
+                    token_source = "audit"
+            except (ValueError, TypeError):
+                output_tokens = None
+        if llm_cost is None:
+            raw_cost = attrs.get("audit.llm_cost")
+            try:
+                llm_cost = float(raw_cost) if raw_cost is not None else None
+            except (ValueError, TypeError):
+                llm_cost = None
+
+        cost_source = "observed" if llm_cost is not None else None
+        # 3) If neither namespace supplied a cost, estimate from tokens against
+        #    the vendored LiteLLM pricing table. Cached models used to charge
+        #    nothing under Langfuse-server-side costing today; this fills that
+        #    gap for the non-Langfuse env.
+        if llm_cost is None:
+            try:
+                from .model_pricing import compute_llm_cost
+                llm_cost, cost_source = compute_llm_cost(
+                    model_name, billable_input_tokens, output_tokens,
+                    cache_read_input_tokens=cache_read_tokens,
+                    cache_creation_input_tokens=cache_creation_tokens,
+                )
+            except Exception as e:
+                log.debug("audit: cost estimation failed: %s", e)
 
         return self._build_event(
             snap=snap,
@@ -348,6 +532,8 @@ class AuditSpanProcessor:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             llm_cost=llm_cost,
+            token_source=token_source,
+            cost_source=cost_source,
         )
 
     # --- Event builder (runs on worker thread — blocking RPC is fine) ---
@@ -423,7 +609,7 @@ class AuditSpanProcessor:
         # Add optional fields
         for key in ("http_method", "http_route", "status_code", "duration_ms",
                      "tool_name", "model_name", "input_tokens", "output_tokens",
-                     "llm_cost"):
+                     "llm_cost", "token_source", "cost_source"):
             if key in extra and extra[key] is not None:
                 event[key] = extra[key]
 
