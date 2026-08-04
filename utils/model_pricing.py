@@ -10,7 +10,7 @@ import os
 
 from pylon.core.tools import log
 
-_PRICE_TABLE_VERSION = "litellm-v1.83.14-stable"
+_PRICE_TABLE_VERSION = "litellm-v1.95.0"
 _PRICES_PATH = os.path.join(os.path.dirname(__file__), "model_prices.json")
 
 _prices_cache = None
