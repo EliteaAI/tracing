@@ -189,6 +189,16 @@ class Module(module.ModuleModel):
         # Register audit SpanProcessor (must be after TracerProvider is set up)
         if self._audit_enabled:
             self._register_audit_processor()
+            # Seed the cost-estimation cache from the costs catalog table
+            # (centry.model_prices) eagerly in the parent so forked workers
+            # inherit the populated cache (incl. custom prices) copy-on-write;
+            # falls back to the bundled seed if the DB is unavailable. Guarded
+            # so tracing never fails on wiring.
+            try:
+                from .utils import model_pricing
+                model_pricing.prime()
+            except Exception as e:
+                log.debug("[TRACING] model_pricing.prime skiped: %s", e)
 
     def _wrap_existing_rpc_handlers(self):
         """Retroactively wrap existing RPC handlers with SERVER-side tracing.
