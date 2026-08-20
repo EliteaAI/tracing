@@ -53,10 +53,20 @@ _LANGFUSE_CACHE_READ_KEYS = (
     "input_cached_tokens",              # OpenAI-bypass shape
     "input_cache_read_input_tokens",    # Anthropic normalized shape
     "cache_read_input_tokens",
+    "input_cache_read",                 # Langfuse-normalized shape (observed live)
 )
 _LANGFUSE_CACHE_CREATE_KEYS = (
     "input_cache_creation_input_tokens",
     "cache_creation_input_tokens",
+    "input_cache_creation",             # Langfuse-normalized shape, paired with input_cache_read
+)
+# langchain-anthropic splits cache-creation tokens by cache TTL tier
+# (5-minute / 1-hour ephemeral caches) and zeroes out input_cache_creation
+# once either tier is populated, to avoid double-counting. Both tiers must
+# be summed in addition to the generic key above.
+_LANGFUSE_CACHE_CREATE_TTL_KEYS = (
+    "input_ephemeral_5m_input_tokens",
+    "input_ephemeral_1h_input_tokens",
 )
 # Cost-detail keys we know how to sum. Any other key is dropped with a warning
 # so future Langfuse schema drift can't silently inflate totals.
@@ -452,7 +462,11 @@ class AuditSpanProcessor:
         input_tokens, input_key = _pick_int_with_key(usage_dict, _LANGFUSE_INPUT_KEYS)
         output_tokens = _pick_int(usage_dict, _LANGFUSE_OUTPUT_KEYS)
         cache_read_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_READ_KEYS) or 0
-        cache_creation_tokens = _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
+        cache_creation_tokens = (
+            _pick_int(usage_dict, _LANGFUSE_CACHE_CREATE_KEYS) or 0
+        ) + sum(
+            (usage_dict or {}).get(k) or 0 for k in _LANGFUSE_CACHE_CREATE_TTL_KEYS
+        )
 
         # Compute the net-of-cache value used ONLY for cost estimation.
         # compute_llm_cost expects an input count that is already exclusive
@@ -531,6 +545,8 @@ class AuditSpanProcessor:
             is_error=bool(attrs.get("audit.is_error", False)),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             llm_cost=llm_cost,
             token_source=token_source,
             cost_source=cost_source,
@@ -609,6 +625,7 @@ class AuditSpanProcessor:
         # Add optional fields
         for key in ("http_method", "http_route", "status_code", "duration_ms",
                      "tool_name", "model_name", "input_tokens", "output_tokens",
+                     "cache_read_tokens", "cache_creation_tokens",
                      "llm_cost", "token_source", "cost_source"):
             if key in extra and extra[key] is not None:
                 event[key] = extra[key]

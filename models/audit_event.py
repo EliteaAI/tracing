@@ -59,6 +59,8 @@ class AuditEvent(db.Base):
     # upstream response_cost is stored rather than failing the audit write.
     input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cache_read_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cache_creation_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     llm_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8), nullable=True)
 
     # Provenance stamps written by AuditSpanProcessor._extract_llm.
