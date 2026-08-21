@@ -151,26 +151,11 @@ def extract_user_from_flask() -> Dict[str, Any]:
             attributes[USER_TYPE_ATTR] = auth_type
 
         if auth_id and auth_id != '-':
-            if auth_type == 'token':
-                # auth.id is the token row's own id, not a user id — resolve it
-                # via auth.current_user() the same way splash.py does, instead
-                # of stamping the token id straight in as user.id.
-                user_info = get_current_user_info()
-                if user_info and user_info.get(USER_ID_ATTR) is not None:
-                    attributes[USER_ID_ATTR] = user_info[USER_ID_ATTR]
-                    if user_info.get(USER_EMAIL_ATTR):
-                        attributes[USER_EMAIL_ATTR] = user_info[USER_EMAIL_ATTR]
-                else:
-                    try:
-                        attributes[USER_ID_ATTR] = int(auth_id)
-                    except (ValueError, TypeError):
-                        attributes[USER_ID_ATTR] = str(auth_id)
-            else:
-                # Convert to int if possible
-                try:
-                    attributes[USER_ID_ATTR] = int(auth_id)
-                except (ValueError, TypeError):
-                    attributes[USER_ID_ATTR] = str(auth_id)
+            # Convert to int if possible
+            try:
+                attributes[USER_ID_ATTR] = int(auth_id)
+            except (ValueError, TypeError):
+                attributes[USER_ID_ATTR] = str(auth_id)
 
         if auth_ref and auth_ref != '-':
             # Truncate reference for privacy
