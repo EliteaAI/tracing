@@ -21,6 +21,41 @@ try:
 except Exception:
     _PLUGIN_VERSION = "0.0.0"
 
+# LangChain's UsageMetadata contract: input_tokens is the SUM of every input
+# token type, and input_token_details is a breakdown of it, not an addition to
+# it. The audit trail persists input NET of cache — analytics adds the cache
+# columns back on top — so these buckets are subtracted before emitting.
+_CACHE_READ_SUFFIXES = ("cache_read",)
+_CACHE_CREATE_SUFFIXES = (
+    "cache_creation",
+    # langchain-anthropic splits cache creation by TTL tier and zeroes the
+    # generic "cache_creation" key once either tier is populated, so summing
+    # all three keys cannot double-count.
+    "ephemeral_5m_input_tokens",
+    "ephemeral_1h_input_tokens",
+)
+# Provider-native token_usage shapes, used only when usage_metadata is absent
+# (e.g. a streaming run with usage reporting disabled).
+_RAW_CACHE_READ_KEYS = ("cached_tokens", "cache_read_input_tokens", "cache_read")
+_RAW_CACHE_CREATE_KEYS = (
+    "cache_write_tokens", "cache_creation_input_tokens", "cache_creation",
+)
+
+
+def _first_positive_int(d, keys):
+    """First positive int-coercible value under any of ``keys``, else 0."""
+    for key in keys:
+        value = d.get(key)
+        if value is None:
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+    return 0
+
 
 class AuditLangChainCallback:
     """Creates OTEL spans for tool/LLM events when Langfuse is not available.
@@ -165,11 +200,16 @@ class AuditLangChainCallback:
             try:
                 if start is not None:
                     span.set_attribute("audit.duration_ms", (time.perf_counter() - start) * 1000)
-                input_tokens, output_tokens = self._extract_tokens(response)
+                input_tokens, output_tokens, cache_read, cache_creation = \
+                    self._extract_tokens(response)
                 if input_tokens is not None:
                     span.set_attribute("audit.input_tokens", input_tokens)
                 if output_tokens is not None:
                     span.set_attribute("audit.output_tokens", output_tokens)
+                if cache_read:
+                    span.set_attribute("audit.cache_read_tokens", cache_read)
+                if cache_creation:
+                    span.set_attribute("audit.cache_creation_tokens", cache_creation)
                 response_cost = self._extract_response_cost(response)
                 if response_cost is not None:
                     span.set_attribute("audit.llm_cost", response_cost)
@@ -201,12 +241,40 @@ class AuditLangChainCallback:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _extract_tokens(response):
-        """Extract (input_tokens, output_tokens) from a LangChain LLMResult."""
+    @classmethod
+    def _extract_tokens(cls, response):
+        """Extract (input, output, cache_read, cache_creation) from an LLMResult.
+
+        ``usage_metadata`` is read before ``llm_output["token_usage"]``: it is
+        the provider-agnostic shape that carries the cache breakdown under
+        ``input_token_details``, and it is the same source the Langfuse handler
+        reads, so both audit paths persist identical numbers. The returned
+        input count is NET of cache.
+        """
         try:
             if response is None:
-                return None, None
+                return None, None, 0, 0
+            generations = getattr(response, 'generations', None) or []
+            for gen_list in generations:
+                for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                    msg = getattr(gen, 'message', None)
+                    if msg is None:
+                        continue
+                    usage = getattr(msg, 'usage_metadata', None)
+                    if not (usage and isinstance(usage, dict)):
+                        continue
+                    inp = usage.get('input_tokens')
+                    if inp is None:
+                        inp = usage.get('prompt_tokens')
+                    out = usage.get('output_tokens')
+                    if out is None:
+                        out = usage.get('completion_tokens')
+                    if inp is None and out is None:
+                        continue
+                    cache_read, cache_creation = cls._cache_from_usage_details(
+                        usage.get('input_token_details')
+                    )
+                    return cls._net_of_cache(inp, out, cache_read, cache_creation)
             llm_out = getattr(response, 'llm_output', None) or {}
             tu = llm_out.get('token_usage') if isinstance(llm_out, dict) else None
             if tu:
@@ -219,26 +287,76 @@ class AuditLangChainCallback:
                 if out is None:
                     out = tu.get('output_tokens')
                 if inp is not None or out is not None:
-                    return inp, out
-            generations = getattr(response, 'generations', None) or []
-            for gen_list in generations:
-                for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
-                    msg = getattr(gen, 'message', None)
-                    if msg is None:
-                        continue
-                    usage = getattr(msg, 'usage_metadata', None)
-                    if usage and isinstance(usage, dict):
-                        inp = usage.get('input_tokens')
-                        if inp is None:
-                            inp = usage.get('prompt_tokens')
-                        out = usage.get('output_tokens')
-                        if out is None:
-                            out = usage.get('completion_tokens')
-                        if inp is not None or out is not None:
-                            return inp, out
-            return None, None
+                    cache_read, cache_creation = cls._cache_from_raw_usage(tu)
+                    return cls._net_of_cache(inp, out, cache_read, cache_creation)
+            return None, None, 0, 0
         except Exception:
-            return None, None
+            return None, None, 0, 0
+
+    @staticmethod
+    def _cache_from_usage_details(details):
+        """Sum the cache buckets of a UsageMetadata input_token_details dict.
+
+        Matched by suffix because langchain-openai prefixes the keys with the
+        service tier ("priority_cache_read", "flex_cache_read"). Keys that are
+        not cache buckets must never be summed — "audio", "reasoning", and the
+        bare service-tier key, which holds input_tokens minus cache_read.
+        """
+        if not isinstance(details, dict):
+            return 0, 0
+        cache_read = 0
+        cache_creation = 0
+        for raw_key, raw_value in details.items():
+            if not isinstance(raw_key, str) or raw_value is None:
+                continue
+            try:
+                count = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if count <= 0:
+                continue
+            if raw_key.endswith(_CACHE_READ_SUFFIXES):
+                cache_read += count
+            elif raw_key.endswith(_CACHE_CREATE_SUFFIXES):
+                cache_creation += count
+        return cache_read, cache_creation
+
+    @staticmethod
+    def _cache_from_raw_usage(usage):
+        """Sum the cache buckets of a provider-native token_usage dict."""
+        if not isinstance(usage, dict):
+            return 0, 0
+        sources = [usage]
+        for nested_key in ("prompt_tokens_details", "input_token_details"):
+            nested = usage.get(nested_key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+        cache_read = 0
+        cache_creation = 0
+        for source in sources:
+            if not cache_read:
+                cache_read = _first_positive_int(source, _RAW_CACHE_READ_KEYS)
+            if not cache_creation:
+                cache_creation = _first_positive_int(source, _RAW_CACHE_CREATE_KEYS)
+        return cache_read, cache_creation
+
+    @staticmethod
+    def _net_of_cache(input_tokens, output_tokens, cache_read, cache_creation):
+        """Subtract the cache buckets from a cache-inclusive input count.
+
+        A provider that already reports input exclusive of cache — its input
+        total would be smaller than the buckets it reports alongside it — is
+        left untouched.
+        """
+        cache_total = cache_read + cache_creation
+        if input_tokens is not None and cache_total:
+            try:
+                total = int(input_tokens)
+            except (TypeError, ValueError):
+                return input_tokens, output_tokens, cache_read, cache_creation
+            if total >= cache_total:
+                input_tokens = total - cache_total
+        return input_tokens, output_tokens, cache_read, cache_creation
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         key = str(run_id)
