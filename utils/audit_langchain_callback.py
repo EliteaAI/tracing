@@ -26,19 +26,20 @@ except Exception:
 # it. The audit trail persists input NET of cache — analytics adds the cache
 # columns back on top — so these buckets are subtracted before emitting.
 _CACHE_READ_SUFFIXES = ("cache_read",)
-_CACHE_CREATE_SUFFIXES = (
-    "cache_creation",
-    # langchain-anthropic splits cache creation by TTL tier and zeroes the
-    # generic "cache_creation" key once either tier is populated, so summing
-    # all three keys cannot double-count.
+_CACHE_CREATE_SUFFIXES = ("cache_creation",)
+# langchain-anthropic also splits cache creation by TTL tier. A provider may
+# report the total, the per-tier split, or both carrying the same tokens, so
+# the two groups are counted separately and never added to each other.
+_CACHE_CREATE_TIER_SUFFIXES = (
     "ephemeral_5m_input_tokens",
     "ephemeral_1h_input_tokens",
 )
-# Provider-native token_usage shapes, used only when usage_metadata is absent
-# (e.g. a streaming run with usage reporting disabled).
+# Provider-native token_usage shapes, read when usage_metadata is absent or
+# when it is missing a cache bucket the provider did report.
 _RAW_CACHE_READ_KEYS = ("cached_tokens", "cache_read_input_tokens", "cache_read")
 _RAW_CACHE_CREATE_KEYS = (
-    "cache_write_tokens", "cache_creation_input_tokens", "cache_creation",
+    "cache_creation_input_tokens", "cache_creation_tokens",
+    "cache_write_tokens", "cache_creation",
 )
 
 
@@ -274,9 +275,19 @@ class AuditLangChainCallback:
                     cache_read, cache_creation = cls._cache_from_usage_details(
                         usage.get('input_token_details')
                     )
+                    if not (cache_read and cache_creation):
+                        # langchain-openai maps only OpenAI's own cache keys, so
+                        # an OpenAI-compatible proxy that names them differently
+                        # (LiteLLM: cache_creation_tokens) leaves the breakdown
+                        # out of usage_metadata while input_tokens still counts
+                        # those tokens. Fill each empty bucket from the raw shape.
+                        raw_read, raw_creation = cls._cache_from_raw_usage(
+                            cls._raw_token_usage(response)
+                        )
+                        cache_read = cache_read or raw_read
+                        cache_creation = cache_creation or raw_creation
                     return cls._net_of_cache(inp, out, cache_read, cache_creation)
-            llm_out = getattr(response, 'llm_output', None) or {}
-            tu = llm_out.get('token_usage') if isinstance(llm_out, dict) else None
+            tu = cls._raw_token_usage(response)
             if tu:
                 # Prefer the first populated value: a canonical key present but
                 # None must not shadow a populated alias in the same dict.
@@ -295,17 +306,21 @@ class AuditLangChainCallback:
 
     @staticmethod
     def _cache_from_usage_details(details):
-        """Sum the cache buckets of a UsageMetadata input_token_details dict.
+        """Split the cache buckets out of a UsageMetadata input_token_details dict.
 
         Matched by suffix because langchain-openai prefixes the keys with the
         service tier ("priority_cache_read", "flex_cache_read"). Keys that are
-        not cache buckets must never be summed — "audio", "reasoning", and the
+        not cache buckets must never be counted — "audio", "reasoning", and the
         bare service-tier key, which holds input_tokens minus cache_read.
+
+        Cache creation can arrive both as a total and split by TTL tier, each
+        carrying the same tokens; the larger group wins so they never add up.
         """
         if not isinstance(details, dict):
             return 0, 0
         cache_read = 0
-        cache_creation = 0
+        creation_total = 0
+        creation_tiered = 0
         for raw_key, raw_value in details.items():
             if not isinstance(raw_key, str) or raw_value is None:
                 continue
@@ -318,19 +333,44 @@ class AuditLangChainCallback:
             if raw_key.endswith(_CACHE_READ_SUFFIXES):
                 cache_read += count
             elif raw_key.endswith(_CACHE_CREATE_SUFFIXES):
-                cache_creation += count
-        return cache_read, cache_creation
+                creation_total += count
+            elif raw_key.endswith(_CACHE_CREATE_TIER_SUFFIXES):
+                creation_tiered += count
+        return cache_read, max(creation_total, creation_tiered)
+
+    @staticmethod
+    def _raw_token_usage(response):
+        """The provider-native token_usage dict of an LLMResult, if present."""
+        llm_out = getattr(response, 'llm_output', None) or {}
+        if not isinstance(llm_out, dict):
+            return None
+        usage = llm_out.get('token_usage')
+        return usage if isinstance(usage, dict) else None
 
     @staticmethod
     def _cache_from_raw_usage(usage):
-        """Sum the cache buckets of a provider-native token_usage dict."""
+        """Read the cache buckets of a provider-native token_usage dict.
+
+        The same count is commonly repeated at the top level and inside the
+        nested detail dicts, so the first populated source wins per bucket
+        instead of the sources being added together.
+        """
         if not isinstance(usage, dict):
             return 0, 0
         sources = [usage]
+        tiered = 0
         for nested_key in ("prompt_tokens_details", "input_token_details"):
             nested = usage.get(nested_key)
-            if isinstance(nested, dict):
-                sources.append(nested)
+            if not isinstance(nested, dict):
+                continue
+            sources.append(nested)
+            tiers = nested.get("cache_creation_token_details")
+            if isinstance(tiers, dict):
+                for tier_key in _CACHE_CREATE_TIER_SUFFIXES:
+                    try:
+                        tiered += int(tiers.get(tier_key) or 0)
+                    except (TypeError, ValueError):
+                        continue
         cache_read = 0
         cache_creation = 0
         for source in sources:
@@ -338,7 +378,7 @@ class AuditLangChainCallback:
                 cache_read = _first_positive_int(source, _RAW_CACHE_READ_KEYS)
             if not cache_creation:
                 cache_creation = _first_positive_int(source, _RAW_CACHE_CREATE_KEYS)
-        return cache_read, cache_creation
+        return cache_read, cache_creation or max(tiered, 0)
 
     @staticmethod
     def _net_of_cache(input_tokens, output_tokens, cache_read, cache_creation):
