@@ -51,27 +51,30 @@ class FakeResponse:
         self.generations = generations or []
 
 
+
 from audit_langchain_callback import AuditLangChainCallback
 _extract = AuditLangChainCallback._extract_tokens
 
 
 def test_none_response():
-    assert _extract(None) == (None, None), "None input must return (None, None)"
+    assert _extract(None) == (None, None, 0, 0), "None input must return no tokens"
 
 
 def test_openai_style_llm_output():
     resp = FakeResponse(llm_output={"token_usage": {"prompt_tokens": 100, "completion_tokens": 50}})
-    inp, out = _extract(resp)
+    inp, out, cache_read, cache_creation = _extract(resp)
     assert inp == 100, f"expected 100 input tokens, got {inp}"
     assert out == 50, f"expected 50 output tokens, got {out}"
+    assert (cache_read, cache_creation) == (0, 0), (cache_read, cache_creation)
 
 
 def test_anthropic_style_llm_output():
     """Anthropic uses input_tokens / output_tokens key names."""
     resp = FakeResponse(llm_output={"token_usage": {"input_tokens": 200, "output_tokens": 80}})
-    inp, out = _extract(resp)
+    inp, out, cache_read, cache_creation = _extract(resp)
     assert inp == 200, inp
     assert out == 80, out
+    assert (cache_read, cache_creation) == (0, 0), (cache_read, cache_creation)
 
 
 def test_usage_metadata_modern():
@@ -79,9 +82,10 @@ def test_usage_metadata_modern():
     msg = FakeMessage(usage_metadata={"input_tokens": 300, "output_tokens": 120})
     gen = FakeGeneration(message=msg)
     resp = FakeResponse(generations=[[gen]])
-    inp, out = _extract(resp)
+    inp, out, cache_read, cache_creation = _extract(resp)
     assert inp == 300, inp
     assert out == 120, out
+    assert (cache_read, cache_creation) == (0, 0), (cache_read, cache_creation)
 
 
 def test_usage_metadata_prompt_completion_keys():
@@ -89,29 +93,39 @@ def test_usage_metadata_prompt_completion_keys():
     msg = FakeMessage(usage_metadata={"prompt_tokens": 50, "completion_tokens": 20})
     gen = FakeGeneration(message=msg)
     resp = FakeResponse(generations=[[gen]])
-    inp, out = _extract(resp)
+    inp, out, _, _ = _extract(resp)
     assert inp == 50, inp
     assert out == 20, out
 
 
-def test_llm_output_preferred_over_usage_metadata():
-    """llm_output takes priority when both present."""
-    msg = FakeMessage(usage_metadata={"input_tokens": 999, "output_tokens": 999})
+def test_usage_metadata_preferred_over_llm_output():
+    """usage_metadata wins: it is the only shape carrying the cache breakdown.
+
+    It is also the source the Langfuse handler reads, so both audit paths
+    persist identical numbers for the same call.
+    """
+    msg = FakeMessage(usage_metadata={
+        "input_tokens": 999,
+        "output_tokens": 999,
+        "input_token_details": {"cache_read": 99},
+    })
     gen = FakeGeneration(message=msg)
     resp = FakeResponse(
         llm_output={"token_usage": {"prompt_tokens": 10, "completion_tokens": 5}},
         generations=[[gen]],
     )
-    inp, out = _extract(resp)
-    assert inp == 10, f"llm_output should be preferred, got {inp}"
-    assert out == 5, f"llm_output should be preferred, got {out}"
+    inp, out, cache_read, _ = _extract(resp)
+    assert inp == 900, f"usage_metadata should win, net of cache: {inp}"
+    assert out == 999, out
+    assert cache_read == 99, cache_read
 
 
 def test_no_token_data_returns_none():
     resp = FakeResponse(llm_output={}, generations=[])
-    inp, out = _extract(resp)
+    inp, out, cache_read, cache_creation = _extract(resp)
     assert inp is None, inp
     assert out is None, out
+    assert (cache_read, cache_creation) == (0, 0), (cache_read, cache_creation)
 
 
 def test_malformed_usage_metadata_does_not_crash():
@@ -119,14 +133,14 @@ def test_malformed_usage_metadata_does_not_crash():
     msg = FakeMessage(usage_metadata="not_a_dict")
     gen = FakeGeneration(message=msg)
     resp = FakeResponse(generations=[[gen]])
-    inp, out = _extract(resp)
+    inp, out, _, _ = _extract(resp)
     assert inp is None and out is None, (inp, out)
 
 
 def test_zero_value_tokens_not_treated_as_missing():
     """Zero is a valid token count — must not be confused with None/missing."""
     resp = FakeResponse(llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 50}})
-    inp, out = _extract(resp)
+    inp, out, _, _ = _extract(resp)
     assert inp == 0, f"expected 0, got {inp}"
     assert out == 50, f"expected 50, got {out}"
 
@@ -136,9 +150,97 @@ def test_zero_value_via_usage_metadata():
     msg = FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 0})
     gen = FakeGeneration(message=msg)
     resp = FakeResponse(generations=[[gen]])
-    inp, out = _extract(resp)
+    inp, out, _, _ = _extract(resp)
     assert inp == 0, f"expected 0, got {inp}"
     assert out == 0, f"expected 0, got {out}"
+
+
+# --- Cache breakdown: UsageMetadata.input_tokens is cache-INCLUSIVE ---
+
+
+def test_anthropic_cache_buckets_subtracted_from_input():
+    """langchain-anthropic adds cache_read + cache_creation into input_tokens."""
+    msg = FakeMessage(usage_metadata={
+        "input_tokens": 4400,
+        "output_tokens": 100,
+        "input_token_details": {"cache_read": 393, "cache_creation": 3928},
+    })
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
+    inp, out, cache_read, cache_creation = _extract(resp)
+    assert inp == 79, f"4400 - 393 - 3928 == 79, got {inp}"
+    assert out == 100, out
+    assert cache_read == 393, cache_read
+    assert cache_creation == 3928, cache_creation
+
+
+def test_anthropic_ephemeral_tiers_counted_as_cache_creation():
+    """TTL-tiered cache writes sum in; generic cache_creation is zeroed upstream."""
+    msg = FakeMessage(usage_metadata={
+        "input_tokens": 1000,
+        "output_tokens": 10,
+        "input_token_details": {
+            "cache_read": 100,
+            "cache_creation": 0,
+            "ephemeral_5m_input_tokens": 300,
+            "ephemeral_1h_input_tokens": 200,
+        },
+    })
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
+    inp, _, cache_read, cache_creation = _extract(resp)
+    assert inp == 400, inp
+    assert cache_read == 100, cache_read
+    assert cache_creation == 500, cache_creation
+
+
+def test_openai_service_tier_cache_keys():
+    """Tier-prefixed cache keys count; the bare tier key and audio never do."""
+    msg = FakeMessage(usage_metadata={
+        "input_tokens": 1000,
+        "output_tokens": 20,
+        "input_token_details": {
+            "audio": 10,
+            "priority_cache_read": 400,
+            # langchain-openai also stores input_tokens minus cache_read under
+            # the bare tier name — summing it would erase the whole input count.
+            "priority": 600,
+        },
+    })
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
+    inp, _, cache_read, cache_creation = _extract(resp)
+    assert inp == 600, inp
+    assert cache_read == 400, cache_read
+    assert cache_creation == 0, cache_creation
+
+
+def test_cache_exclusive_input_is_left_alone():
+    """A provider already reporting input net of cache must not be subtracted."""
+    msg = FakeMessage(usage_metadata={
+        "input_tokens": 50,
+        "output_tokens": 5,
+        "input_token_details": {"cache_read": 900},
+    })
+    gen = FakeGeneration(message=msg)
+    resp = FakeResponse(generations=[[gen]])
+    inp, _, cache_read, _ = _extract(resp)
+    assert inp == 50, inp
+    assert cache_read == 900, cache_read
+
+
+def test_raw_token_usage_nested_cache_details():
+    """OpenAI raw token_usage keeps cached tokens under prompt_tokens_details."""
+    resp = FakeResponse(llm_output={"token_usage": {
+        "prompt_tokens": 1000,
+        "completion_tokens": 200,
+        "prompt_tokens_details": {"cached_tokens": 250},
+    }})
+    inp, out, cache_read, cache_creation = _extract(resp)
+    assert inp == 750, inp
+    assert out == 200, out
+    assert cache_read == 250, cache_read
+    assert cache_creation == 0, cache_creation
 
 
 _extract_cost = AuditLangChainCallback._extract_response_cost

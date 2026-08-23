@@ -112,6 +112,17 @@ def _pick_int(d, keys):
     return None
 
 
+def _int_attr(attrs, key):
+    """Read a span attribute as int, tolerating strings and junk values."""
+    raw = attrs.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _pick_int_with_key(d, keys):
     """Like ``_pick_int`` but also returns which key matched (or None, None).
 
@@ -468,26 +479,6 @@ class AuditSpanProcessor:
             (usage_dict or {}).get(k) or 0 for k in _LANGFUSE_CACHE_CREATE_TTL_KEYS
         )
 
-        # Compute the net-of-cache value used ONLY for cost estimation.
-        # compute_llm_cost expects an input count that is already exclusive
-        # of cache tokens. Langfuse's normalized shape (Anthropic, Vertex,
-        # Bedrock, Ollama) already emits "input" net of cache, so this is
-        # a passthrough. The OpenAI-bypass shape keeps prompt_tokens
-        # inclusive of cached tokens — subtract before pricing to avoid
-        # double-charging (once at base input_price, once at cache_read_price).
-        # Do NOT mutate input_tokens: the raw prompt/input count is what
-        # gets persisted to audit_events.input_tokens and rendered in the
-        # analytics UI's "Input tokens" KPI. Subtracting there would make
-        # the KPI silently under-report cache-heavy OpenAI workloads.
-        if input_tokens is not None and input_key == "prompt_tokens" and (
-            cache_read_tokens or cache_creation_tokens
-        ):
-            billable_input_tokens = max(
-                0, input_tokens - cache_read_tokens - cache_creation_tokens
-            )
-        else:
-            billable_input_tokens = input_tokens
-
         llm_cost = _pick_cost(cost_dict)
         token_source = "langfuse" if (
             input_tokens is not None or output_tokens is not None
@@ -495,7 +486,10 @@ class AuditSpanProcessor:
 
         # 2) audit.* namespace — populated by AuditLangChainCallback when
         #    Langfuse credentials are absent. Fills in whichever fields the
-        #    Langfuse path didn't already produce.
+        #    Langfuse path didn't already produce. audit.input_tokens arrives
+        #    already NET of cache: the callback subtracts the UsageMetadata
+        #    input_token_details buckets and emits them as their own
+        #    attributes, so cache is never folded into the input count.
         if input_tokens is None:
             raw_in = attrs.get("audit.input_tokens")
             try:
@@ -512,12 +506,38 @@ class AuditSpanProcessor:
                     token_source = "audit"
             except (ValueError, TypeError):
                 output_tokens = None
+        if not cache_read_tokens:
+            cache_read_tokens = _int_attr(attrs, "audit.cache_read_tokens") or 0
+        if not cache_creation_tokens:
+            cache_creation_tokens = (
+                _int_attr(attrs, "audit.cache_creation_tokens") or 0
+            )
         if llm_cost is None:
             raw_cost = attrs.get("audit.llm_cost")
             try:
                 llm_cost = float(raw_cost) if raw_cost is not None else None
             except (ValueError, TypeError):
                 llm_cost = None
+
+        # Net-of-cache count used ONLY for cost estimation. compute_llm_cost
+        # prices cache_read / cache_creation on their own (much cheaper) rates,
+        # so the input count handed to it must exclude them. The Langfuse
+        # normalized shape ("input") and the audit shape are both already net,
+        # so this is a passthrough for them. Only the OpenAI-bypass shape keeps
+        # prompt_tokens inclusive of cached tokens — subtract before pricing to
+        # avoid double-charging (once at base input_price, once at
+        # cache_read_price). Do NOT mutate input_tokens for that shape: the raw
+        # prompt count is what gets persisted to audit_events.input_tokens.
+        # Runs after the audit fallback so an audit-only span prices its input
+        # instead of silently dropping it.
+        if input_tokens is not None and input_key == "prompt_tokens" and (
+            cache_read_tokens or cache_creation_tokens
+        ):
+            billable_input_tokens = max(
+                0, input_tokens - cache_read_tokens - cache_creation_tokens
+            )
+        else:
+            billable_input_tokens = input_tokens
 
         cost_source = "observed" if llm_cost is not None else None
         # 3) If neither namespace supplied a cost, estimate from tokens against
