@@ -26,6 +26,8 @@ USER_EMAIL_ATTR = f"{USER_ATTR_PREFIX}.email"
 USER_NAME_ATTR = f"{USER_ATTR_PREFIX}.name"
 USER_REFERENCE_ATTR = f"{USER_ATTR_PREFIX}.reference"
 PROJECT_ID_ATTR = "project.id"
+# API token used for the request (token auth only; user.id stays the token owner)
+TOKEN_ID_ATTR = "auth.token.id"
 
 # Baggage keys (used for cross-service propagation)
 BAGGAGE_USER_ID = "user_id"
@@ -123,6 +125,65 @@ def extract_user_from_baggage() -> Dict[str, Any]:
     return attributes
 
 
+# ---------------------------------------------------------------------------
+# Token -> owning user resolution
+# ---------------------------------------------------------------------------
+# Token auth (Bearer / Basic with an API token) puts the *token* row id into
+# X-Auth-ID / g.auth.id, while session auth puts the *user* id there.  Both end
+# up in the same user.id attribute (and audit_events.user_id column), so token
+# traffic has to be mapped back to the token owner or it lands on a user id that
+# does not exist - or, worse, on an unrelated real user with the same id.
+#
+# Token -> user_id never changes for a given token id, so successful lookups are
+# cached for the service lifetime.  Failures are not cached: they fall back to
+# the previous behaviour (raw auth id) and are retried on the next request.
+_token_user_cache: Dict[int, int] = {}
+
+
+def resolve_token_user_id(token_id) -> Optional[int]:
+    """Resolve the id of the user owning an API token, or None if unknown."""
+    try:
+        tid = int(token_id)
+    except (TypeError, ValueError):
+        return None
+
+    if tid in _token_user_cache:
+        return _token_user_cache[tid]
+
+    try:
+        from tools import auth
+
+        token = auth.get_token(token_id=tid)
+        user_id = int(token["user_id"]) if token and token.get("user_id") is not None else None
+    except Exception as e:  # noqa: BLE001 - never fail a request over tracing
+        log.debug(f"Failed to resolve owner of token {token_id}: {e}")
+        return None
+
+    if user_id is not None:
+        _token_user_cache[tid] = user_id
+
+    return user_id
+
+
+def _identity_attributes(auth_type, auth_id) -> Dict[str, Any]:
+    """Build user.id (plus auth.token.id for token auth) from an auth type/id pair."""
+    attributes = {}
+
+    if auth_type == 'token':
+        user_id = resolve_token_user_id(auth_id)
+        if user_id is not None:
+            attributes[USER_ID_ATTR] = user_id
+            attributes[TOKEN_ID_ATTR] = int(auth_id)
+            return attributes
+
+    try:
+        attributes[USER_ID_ATTR] = int(auth_id)
+    except (ValueError, TypeError):
+        attributes[USER_ID_ATTR] = str(auth_id)
+
+    return attributes
+
+
 def extract_user_from_flask() -> Dict[str, Any]:
     """
     Extract user context from Flask's g.auth object.
@@ -151,11 +212,7 @@ def extract_user_from_flask() -> Dict[str, Any]:
             attributes[USER_TYPE_ATTR] = auth_type
 
         if auth_id and auth_id != '-':
-            # Convert to int if possible
-            try:
-                attributes[USER_ID_ATTR] = int(auth_id)
-            except (ValueError, TypeError):
-                attributes[USER_ID_ATTR] = str(auth_id)
+            attributes.update(_identity_attributes(auth_type, auth_id))
 
         if auth_ref and auth_ref != '-':
             # Truncate reference for privacy
@@ -195,10 +252,7 @@ def extract_user_from_headers() -> Dict[str, Any]:
             attributes[USER_TYPE_ATTR] = auth_type
 
         if auth_id and auth_id != '-':
-            try:
-                attributes[USER_ID_ATTR] = int(auth_id)
-            except (ValueError, TypeError):
-                attributes[USER_ID_ATTR] = str(auth_id)
+            attributes.update(_identity_attributes(auth_type, auth_id))
 
         if auth_ref and auth_ref != '-':
             attributes[USER_REFERENCE_ATTR] = str(auth_ref)[:32]
