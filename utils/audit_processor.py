@@ -21,6 +21,7 @@ Supports spans from:
 
 import json
 import threading
+import time
 from queue import SimpleQueue
 
 from pylon.core.tools import log
@@ -205,6 +206,8 @@ class AuditSpanProcessor:
         self._queue = SimpleQueue()
         self._worker = None
         self._lock = threading.Lock()
+        self._pending_writes = 0
+        self._pending_condition = threading.Condition(self._lock)
 
     def _ensure_worker(self):
         """Start the drain worker if not already running (lazy, post-fork safe)."""
@@ -260,6 +263,8 @@ class AuditSpanProcessor:
             audit_data = self._extract(snapshot)
             if audit_data:
                 self._ensure_worker()
+                with self._pending_condition:
+                    self._pending_writes += 1
                 self._queue.put(audit_data)
         except Exception as e:
             log.debug(f"AuditSpanProcessor.on_end error: {e}")
@@ -270,9 +275,18 @@ class AuditSpanProcessor:
             self._worker.join(timeout=5)
 
     def force_flush(self, timeout_millis=None):
-        # Nothing to flush (events are enqueued in on_end), but return True, not
-        # None: a falsy result can make a multi-processor force_flush treat this
-        # as failure and skip later processors, e.g. Langfuse (#5391).
+        timeout_seconds = None if timeout_millis is None else timeout_millis / 1000
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+
+        with self._pending_condition:
+            while self._pending_writes:
+                if deadline is None:
+                    self._pending_condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pending_condition.wait(timeout=remaining)
         return True
 
     # --- Background worker (own thread — blocking write_fn is fine here) ---
@@ -284,7 +298,12 @@ class AuditSpanProcessor:
                 item = self._queue.get()
                 if item is _STOP:
                     break
-                self.write_fn(item)
+                try:
+                    self.write_fn(item)
+                finally:
+                    with self._pending_condition:
+                        self._pending_writes -= 1
+                        self._pending_condition.notify_all()
             except Exception as e:
                 log.debug(f"AuditSpanProcessor worker error: {e}")
 
