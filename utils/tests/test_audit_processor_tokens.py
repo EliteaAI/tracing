@@ -7,6 +7,7 @@ Run standalone:
 
 import json
 import sys
+import threading
 import types
 import pathlib
 import unittest.mock as mock
@@ -90,6 +91,42 @@ def _make_processor():
     events = []
     proc = AuditSpanProcessor(write_fn=events.append)
     return proc, events
+
+
+class _FakeSpan:
+    def __init__(self, attrs):
+        self.attributes = attrs
+        self.name = "gpt-4o"
+        self.parent = None
+        self.start_time = 1_000_000_000
+        self.end_time = 2_000_000_000
+        self.status = types.SimpleNamespace(is_ok=True)
+
+    def get_span_context(self):
+        return types.SimpleNamespace(trace_id=1, span_id=2)
+
+
+def test_force_flush_waits_for_queued_audit_write():
+    """force_flush must not report success while a queued audit write is blocked."""
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def write_fn(_event):
+        write_started.set()
+        release_write.wait(timeout=1)
+
+    proc = AuditSpanProcessor(write_fn=write_fn)
+    proc.on_end(_FakeSpan({
+        "audit.observation.type": "generation",
+        "audit.model.name": "gpt-4o",
+    }))
+
+    assert write_started.wait(timeout=1)
+    assert proc.force_flush(timeout_millis=10) is False
+
+    release_write.set()
+    assert proc.force_flush(timeout_millis=1_000) is True
+    proc.shutdown()
 
 
 def test_extract_llm_no_tokens():
@@ -322,7 +359,7 @@ def test_cost_estimated_gpt4o():
     # gpt-4o v1.83.14: input $2.5e-6/token, output $1.0e-5/token
     expected = 1000 * 2.5e-6 + 500 * 1.0e-5
     assert abs(event.get("llm_cost", 0) - expected) < 1e-10, event
-    assert event.get("cost_source", "").startswith("estimated:litellm-"), event
+    assert event.get("cost_source") == "estimated:costs-catalog", event
 
 
 def test_cost_estimated_claude_with_cache_read():
