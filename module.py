@@ -196,7 +196,12 @@ class Module(module.ModuleModel):
             # so tracing never fails on wiring.
             try:
                 from .utils import model_pricing
-                model_pricing.prime()
+                if self._audit_mode == 'writer':
+                    model_pricing.prime()
+                else:
+                    # forwarder mode (pylon_indexer): pricing is DB-writer-only,
+                    # never build a DB engine from this background worker.
+                    model_pricing.prime_bundled_only()
             except Exception as e:
                 log.debug("[TRACING] model_pricing.prime skiped: %s", e)
 

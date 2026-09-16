@@ -25,6 +25,7 @@ from pylon.core.tools import log
 
 _COST_SOURCE_TAG = "estimated:costs-catalog"
 _SEED_TTL = 86400  # reseed at most once/day
+_SEED_RETRY_FLOOR = 60  # after a total (DB + bundled) seed failure, retry this soon instead of waiting a day
 _SEED_PATH = os.path.join(os.path.dirname(__file__), "prices_seed.json")
 _SCHEMA = os.environ.get("POSTGRES_SCHEMA", "centry")
 
@@ -41,6 +42,7 @@ _by_name = None        # {model_name: price_dict}
 _alias_index = None    # {alias: model_name}
 _last_seeded = 0.0
 _unknown_models = set()  # dedupe per-model WARN logs
+_bundled_only = False  # forwarder mode: pricing is DB-writer-only, never seed from the DB
 
 
 def configure(rpc_manager=None):
@@ -66,6 +68,18 @@ def prime():
         except Exception:
             pass
         _engine = None
+
+
+def prime_bundled_only():
+    """Forwarder-mode seeding (pylon_indexer): pricing is DB-writer-only here.
+
+    Sets a permanent flag before seeding so later cache-expiry reseeds from
+    `_ensure_seeded` (e.g. after the 24h TTL) also stay on the bundled dump
+    instead of building a DB engine from a forwarder-mode background thread.
+    """
+    global _bundled_only
+    _bundled_only = True
+    _ensure_seeded()
 
 
 def _get_engine():
@@ -153,10 +167,11 @@ def _ensure_seeded():
         if _by_name is not None and (time.time() - _last_seeded) < _SEED_TTL:
             return
         seeded = None
-        try:
-            seeded = _seed_from_db()
-        except Exception as e:
-            log.warning("model_pricing: DB seed failed, using bundled: %r", e)
+        if not _bundled_only:
+            try:
+                seeded = _seed_from_db()
+            except Exception as e:
+                log.warning("model_pricing: DB seed failed, using bundled: %r", e)
         if not seeded:
             seeded = _seed_from_bundled()
         by_name, alias_index = seeded
@@ -167,6 +182,10 @@ def _ensure_seeded():
         # failure retries on the next call instead of being stuck for a day.
         if by_name:
             _last_seeded = time.time()
+        elif _by_name is not None:
+            # Total double failure (DB + bundled): retry soon instead of every
+            # single lookup forever, but don't wait the full success TTL either.
+            _last_seeded = time.time() - _SEED_TTL + _SEED_RETRY_FLOOR
 
 
 def _lookup(model_name):
