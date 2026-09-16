@@ -189,16 +189,6 @@ class Module(module.ModuleModel):
         # Register audit SpanProcessor (must be after TracerProvider is set up)
         if self._audit_enabled:
             self._register_audit_processor()
-            # Seed the cost-estimation cache from the costs catalog table
-            # (centry.model_prices) eagerly in the parent so forked workers
-            # inherit the populated cache (incl. custom prices) copy-on-write;
-            # falls back to the bundled seed if the DB is unavailable. Guarded
-            # so tracing never fails on wiring.
-            try:
-                from .utils import model_pricing
-                model_pricing.prime()
-            except Exception as e:
-                log.debug("[TRACING] model_pricing.prime skiped: %s", e)
 
     def _wrap_existing_rpc_handlers(self):
         """Retroactively wrap existing RPC handlers with SERVER-side tracing.
@@ -1114,9 +1104,9 @@ class Module(module.ModuleModel):
         except Exception as e:
             # Escalated from debug to warning after a round-3 review found
             # this line was masking silent full-row loss on schema-mismatch
-            # deploys (e.g. tracing PR landed before the elitea_core admin
-            # task added token_source/cost_source columns). Dedup per unique
-            # error message so a schema-drift storm doesn't spam the log.
+            # deploys (a column the model declares but the table lacks, or the
+            # reverse). Dedup per unique error message so a schema-drift storm
+            # doesn't spam the log.
             key = str(e)[:200]
             if key not in _audit_write_errors_seen:
                 _audit_write_errors_seen.add(key)

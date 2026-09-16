@@ -1,10 +1,8 @@
 """Audit trail event model for persisting user actions and agent tool calls."""
 
 from datetime import datetime
-from decimal import Decimal
-from typing import Optional
 
-from sqlalchemy import Integer, String, DateTime, SmallInteger, Float, Boolean, Numeric, func, Index, text
+from sqlalchemy import Integer, String, DateTime, SmallInteger, Float, Boolean, func, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tools import db, config as c
@@ -57,23 +55,10 @@ class AuditEvent(db.Base):
     tool_name: Mapped[str] = mapped_column(String(256), nullable=True)
     model_name: Mapped[str] = mapped_column(String(256), nullable=True)
 
-    # Token usage and cost tracking
-    # Numeric(18, 8): 10 integer digits (max ~1e10) so a large/misconfigured
-    # upstream response_cost is stored rather than failing the audit write.
-    input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    cache_read_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    cache_creation_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    llm_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8), nullable=True)
-
-    # Provenance stamps written by AuditSpanProcessor._extract_llm.
-    # Kept in this ORM class explicitly because module._write_audit_event
-    # filters the event dict with `hasattr(AuditEvent, k)` — a field the
-    # class doesn't declare is silently dropped before INSERT.
-    # cost_source(64) coordinates with elitea_core's schema-guard width
-    # so future '-stable.patch.N' pricing-table tags don't overflow.
-    token_source: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
-    cost_source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Token usage and cost live on usage_event, owned by the usage plugin (#6574).
+    # Nothing token- or cost-shaped belongs here: module._write_audit_event filters
+    # the event dict with `hasattr(AuditEvent, k)`, so re-adding a field here is
+    # enough to start writing it again.
 
     # Trace linkage
     trace_id: Mapped[str] = mapped_column(String(32), nullable=True)
