@@ -878,9 +878,12 @@ class Module(module.ModuleModel):
                         rpc_name = name if name else getattr(handler, '__name__', 'unknown_rpc')
                         # Apply tracing wrapper at execution time
                         traced_fn = tracing_self._rpc_server_wrapper(rpc_name)(handler)
-                        return traced_fn(*handler_args, **handler_kwargs)
                     except Exception as e:
                         log.debug(f"RPC server tracing failed for {name}: {e}")
+                    else:
+                        # Invocation errors belong to the RPC caller, not to
+                        # wrapper setup; falling back here would repeat side effects.
+                        return traced_fn(*handler_args, **handler_kwargs)
 
                 # Fallback: execute without tracing
                 return handler(*handler_args, **handler_kwargs)

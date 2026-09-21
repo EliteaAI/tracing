@@ -52,6 +52,9 @@ def create_rpc_server_wrapper(
                 if tracer is None:
                     return func(*args, **kwargs)
 
+                no_result = object()
+                result = no_result
+                handler_error = None
                 try:
                     from opentelemetry.trace import SpanKind, Status, StatusCode
 
@@ -150,24 +153,30 @@ def create_rpc_server_wrapper(
                     ) as span:
                         try:
                             result = func(*args, **kwargs)
-                            duration_ms = (time.perf_counter() - start_time) * 1000
-                            span.set_attribute('rpc.duration_ms', duration_ms)
-                            span.set_status(Status(StatusCode.OK))
-                            return result
-                        except Exception as e:
+                        except BaseException as e:
+                            handler_error = e
                             duration_ms = (time.perf_counter() - start_time) * 1000
                             span.set_attribute('rpc.duration_ms', duration_ms)
                             span.set_attribute('rpc.error', str(e)[:500])
                             span.set_status(Status(StatusCode.ERROR, str(e)))
                             span.record_exception(e)
                             raise
+                        else:
+                            duration_ms = (time.perf_counter() - start_time) * 1000
+                            span.set_attribute('rpc.duration_ms', duration_ms)
+                            span.set_status(Status(StatusCode.OK))
+                            return result
 
-                except ImportError:
-                    # OpenTelemetry not available, run without tracing
-                    return func(*args, **kwargs)
                 except Exception as e:
-                    # Tracing failed, but don't break the RPC handler
+                    # Instrumentation may fail before entry or while recording
+                    # an outcome. Never execute an entered business handler twice.
+                    if handler_error is not None:
+                        if e is handler_error:
+                            raise
+                        raise handler_error.with_traceback(handler_error.__traceback__) from None
                     log.warning(f"RPC server tracing failed for {rpc_name}: {e}")
+                    if result is not no_result:
+                        return result
                     return func(*args, **kwargs)
 
             return traced_rpc_handler
