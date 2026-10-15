@@ -349,7 +349,7 @@ find the tool keep a local in-process counter and still write the log line.
 | `security_audit_outbox_depth` | observable gauge | none | `tracing`: pending outbox rows, read on each export |
 | `security_audit_delivery_lag_seconds` | observable gauge (`s`) | none | `tracing`: age of the last delivered row; no sample before the first delivery |
 
-Example: `security_metric name=worker_capability_reject_total value=1 capability=envelope.v1`.
+Example: `security_metric name=worker_capability_reject_total value=1 capability=task_envelope.v1`.
 
 Counter names are kept as they were; the OTel counters carry them unchanged, so a Prometheus-style exporter
 that appends `_total` may need a rename rule in the collector.
