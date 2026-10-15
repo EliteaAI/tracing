@@ -976,6 +976,13 @@ class Module(module.ModuleModel):
         An invalid ``security_audit`` config raises; infrastructure failures only log,
         so a process without database access still boots.
         """
+        # The outbox lives in the shared database. Pylons without the `db` tool
+        # (pylon_auth, pylon_indexer) have no outbox to serve: skip, never fail init.
+        try:
+            from tools import db  # pylint: disable=C0415
+        except ImportError:
+            log.info("Security audit outbox not available here (no db tool); skipping")
+            return
         from .utils import security_audit
 
         settings = security_audit.SecurityAuditSettings.from_config(self.config.get('security_audit'))
@@ -983,7 +990,6 @@ class Module(module.ModuleModel):
         self.descriptor.init_rpcs()
         try:
             from .models.security_audit_outbox import SecurityAuditEvent
-            from tools import db
 
             db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
         except Exception as e:
