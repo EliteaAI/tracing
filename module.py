@@ -59,12 +59,16 @@ class Module(module.ModuleModel):
         self._audit_mode = None
         self._audit_config = {}
         self._audit_event_node = None
+        # Security audit outbox relay (#6945)
+        self._security_audit_relay = None
         # Email cache moved to utils.user_context (service-level singleton)
 
     def init(self):
         """Initialize the tracing plugin."""
         # Re-read config from descriptor (external config may have been merged after __init__)
         self.config = self.descriptor.config
+        # Security audit is independent of the tracing and audit_trail flags (#6945)
+        self._init_security_audit()
         # Determine if API endpoints should be registered (status/collect/otlp endpoints)
         self._register_api = _API_TOOLS_IMPORTABLE and self.config.get('register_api', False)
 
@@ -963,6 +967,35 @@ class Module(module.ModuleModel):
             log.warning(f"Failed to set up EventNode log routing: {e}")
 
     # ========================
+    # Security audit outbox (#6945, C-1009)
+    # ========================
+
+    def _init_security_audit(self):
+        """Create the outbox table, expose the admission RPC, optionally start the relay.
+
+        An invalid ``security_audit`` config raises; infrastructure failures only log,
+        so a process without database access still boots.
+        """
+        from .utils import security_audit
+
+        settings = security_audit.SecurityAuditSettings.from_config(self.config.get('security_audit'))
+        security_audit.configure(settings)
+        self.descriptor.init_rpcs()
+        try:
+            from .models.security_audit_outbox import SecurityAuditEvent
+            from tools import db
+
+            db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
+        except Exception as e:
+            log.warning(f"Security audit table could not be created/verified: {e}")
+        if settings.relay_enabled:
+            from .utils.security_audit_relay import SecurityAuditRelay, JsonLinesFileSink
+
+            self._security_audit_relay = SecurityAuditRelay(settings, JsonLinesFileSink(settings.sink_path))
+            self._security_audit_relay.start()
+            log.info(f"Security audit relay started (sink={settings.sink_path})")
+
+    # ========================
     # Audit Trail
     # ========================
 
@@ -1254,6 +1287,12 @@ class Module(module.ModuleModel):
 
     def deinit(self):
         """Cleanup tracing resources."""
+        if self._security_audit_relay:
+            try:
+                self._security_audit_relay.stop()
+            except Exception as e:
+                log.warning(f"Error during security audit relay shutdown: {e}")
+
         # Shutdown audit trail EventNode
         if self._audit_event_node:
             try:
