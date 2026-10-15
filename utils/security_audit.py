@@ -7,7 +7,6 @@ the relay's job (``security_audit_relay``).
 Nothing consumes ``security_audit_admission_allowed`` yet: admission wiring is #6756/#6758.
 """
 
-import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from sqlalchemy import func, select
 
 from ..models.security_audit_event import SecurityAuditEventV1
 from ..models.security_audit_outbox import SecurityAuditEvent, DELIVERY_PENDING
+from .security_metrics import SECURITY_METRICS
 
 FAIL_CLOSED = "fail_closed"
 BUFFER = "buffer"
@@ -30,23 +30,9 @@ class SecurityAuditUnavailable(RuntimeError):
     """The audit row could not be recorded and the policy is fail_closed."""
 
 
-class Counter:
-    """In-process monotonic counter (prometheus_client is not available in plugins)."""
-
-    def __init__(self):
-        self._value = 0
-        self._lock = threading.Lock()
-
-    def inc(self, amount: int = 1) -> None:
-        with self._lock:
-            self._value += amount
-
-    def total(self) -> int:
-        return self._value
-
-
 # Events lost because the outbox itself could not be written. Never increments under fail_closed.
-security_audit_drop_total = Counter()
+security_audit_drop_total = SECURITY_METRICS.counter(
+    "security_audit_drop_total", "Security audit events lost because the outbox could not be written")
 
 
 @dataclass(frozen=True)
@@ -193,3 +179,13 @@ def security_audit_metrics(*, session_scope=None, now: Optional[datetime] = None
             None if last_delivered is None else (now - last_delivered).total_seconds()),
         "security_audit_drop_total": security_audit_drop_total.total(),
     }
+
+
+def register_audit_gauges(security_metrics=SECURITY_METRICS) -> None:
+    """Export outbox depth and delivery lag as observable gauges (read on each export)."""
+    security_metrics.gauge_callback(
+        "security_audit_outbox_depth", "Pending security audit outbox rows",
+        lambda: security_audit_metrics()["security_audit_outbox_depth"])
+    security_metrics.gauge_callback(
+        "security_audit_delivery_lag_seconds", "Age of the last delivered security audit row",
+        lambda: security_audit_metrics()["security_audit_delivery_lag_seconds"], unit="s")
