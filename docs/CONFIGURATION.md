@@ -287,3 +287,37 @@ metrics:
     include_per_cpu: false
     include_network: false    # If not needed
 ```
+
+## Security Audit Outbox
+
+Schema v1 security audit events (#6945, C-1009) live in the `security_audit_events` table, which is
+also the transactional outbox. It is independent of `enabled`, `audit_trail` and Langfuse. The table
+is created with `create_all` at plugin init in every pylon that loads this plugin; there is no SQL
+migration. Policy is operator config only and is deliberately absent from `admin_schema.json`.
+
+```yaml
+security_audit:
+  failure_policy: buffer     # buffer (default) | fail_closed
+  backlog_limit: 10000       # pending rows above this are "backlog exceeded"
+  relay:
+    enabled: false           # default off: nothing is delivered, rows accumulate
+    interval_s: 5            # poll interval; a full batch is followed immediately by the next
+    batch_size: 100
+    max_attempts: 10         # then delivery_state = failed
+    sink:
+      type: jsonl            # only sink in v1
+      path: null             # required when relay.enabled
+```
+
+- Callers add a row in their own transaction with `utils.security_audit.record_security_event(session, event)`
+  (no commit inside), or use `record_security_event_autocommit(event)` when they have no transaction.
+  Under `fail_closed` an autocommit failure raises `SecurityAuditUnavailable`; under `buffer` it
+  increments `security_audit_drop_total` and returns `None`.
+- The relay claims due rows with `FOR UPDATE SKIP LOCKED`, writes one OCSF-shaped JSON object per line
+  and retries with full-jitter exponential backoff (base 1 s, cap 300 s). Delivery is at-least-once;
+  consumers deduplicate on `metadata.uid` (the `event_id`). Enable it in one pylon (normally `pylon_main`).
+- RPC `security_audit_admission_allowed` returns `False` only under `fail_closed` when pending rows exceed
+  `backlog_limit` (count cached for 5 s; an unreadable count is treated as exceeded). Nothing calls it yet.
+- In-process metrics: `utils.security_audit.security_audit_metrics()` returns
+  `security_audit_outbox_depth`, `security_audit_delivery_lag_seconds` (age of the last delivered row)
+  and `security_audit_drop_total`.

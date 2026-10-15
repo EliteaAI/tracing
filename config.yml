@@ -2,3 +2,18 @@ enabled: false
 
 event_node:
   type: MockEventNode
+
+# Security audit outbox (#6945). The table and the admission RPC always exist; the relay is
+# opt-in. Enable the relay in one process (normally pylon_main): rows are claimed with
+# SKIP LOCKED, so more than one is safe, but each writes to its own sink file.
+security_audit:
+  failure_policy: buffer   # buffer | fail_closed
+  backlog_limit: 10000     # pending rows above this make admission refuse under fail_closed
+  relay:
+    enabled: false
+    interval_s: 5
+    batch_size: 100
+    max_attempts: 10
+    sink:
+      type: jsonl
+      path: null           # required when relay.enabled, e.g. /var/log/elitea/security_audit.jsonl
