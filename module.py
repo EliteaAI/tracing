@@ -18,6 +18,7 @@ from pylon.core.tools import module, log
 
 # Data type constants for telemetry routing
 from .core.data_types import TelemetryDataType, TELEMETRY_DATA_TYPE_KEY
+from .utils.security_metrics import SECURITY_METRICS
 
 # Check if api_tools is available (pylon_main/pylon_auth only)
 try:
@@ -67,7 +68,8 @@ class Module(module.ModuleModel):
         """Initialize the tracing plugin."""
         # Re-read config from descriptor (external config may have been merged after __init__)
         self.config = self.descriptor.config
-        # Security audit is independent of the tracing and audit_trail flags (#6945)
+        # Security metrics and audit are independent of the tracing and audit_trail flags (#6754, #6945)
+        self.descriptor.register_tool("security_metrics", SECURITY_METRICS)
         self._init_security_audit()
         # Determine if API endpoints should be registered (status/collect/otlp endpoints)
         self._register_api = _API_TOOLS_IMPORTABLE and self.config.get('register_api', False)
@@ -989,6 +991,10 @@ class Module(module.ModuleModel):
         security_audit.configure(settings)
         self.descriptor.init_rpcs()
         try:
+            security_audit.register_audit_gauges()
+        except Exception as e:
+            log.warning(f"Security audit gauges could not be registered: {e}")
+        try:
             from .models.security_audit_outbox import SecurityAuditEvent
 
             db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
@@ -1293,6 +1299,11 @@ class Module(module.ModuleModel):
 
     def deinit(self):
         """Cleanup tracing resources."""
+        try:
+            self.descriptor.unregister_tool("security_metrics")
+        except Exception as e:
+            log.warning(f"Error unregistering security_metrics tool: {e}")
+
         if self._security_audit_relay:
             try:
                 self._security_audit_relay.stop()

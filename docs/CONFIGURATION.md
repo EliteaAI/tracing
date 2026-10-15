@@ -321,3 +321,35 @@ security_audit:
 - In-process metrics: `utils.security_audit.security_audit_metrics()` returns
   `security_audit_outbox_depth`, `security_audit_delivery_lag_seconds` (age of the last delivered row)
   and `security_audit_drop_total`.
+
+## Security Metrics
+
+Every C-1009 security counter (#6754) is recorded by one helper, `utils/security_metrics.py`, which the
+plugin publishes as `tools.security_metrics` before the `enabled` gate (it exists even with tracing off).
+Each increment (a) adds to an OpenTelemetry counter on the `elitea.security` meter, (b) updates an
+in-process total per label set, and (c) writes one INFO log line through `pylon.core.tools.log`:
+
+```
+security_metric name=<name> value=<n> <label>=<value> ...
+```
+
+Label keys follow the metric's declared order. Values are reason codes, capability names or ids; each is
+reduced to one token (characters outside `A-Za-z0-9_.:/@+-` become `_`, at most 64 characters). The OTel
+export uses the tracing MeterProvider, so it needs `enabled: true`, `otlp.enabled: true` and
+`instrumentation.system_metrics` (the default); the log line is always written. Consumer plugins that cannot
+find the tool keep a local in-process counter and still write the log line.
+
+| Metric | Type | Labels | Recorded by |
+|--------|------|--------|-------------|
+| `governed_dispatch_unavailable_total` | counter | none | `elitea_core`: governed task refused, no live worker supports it |
+| `worker_capability_reject_total` | counter | `capability` | `indexer_worker`: envelope refused by the worker |
+| `auth_epoch_mismatch_total` | counter | none | `auth`: cached auth result built under an older epoch |
+| `auth_invalidate_events_total` | counter | none | `auth`: `auth_invalidate` event handled |
+| `security_audit_drop_total` | counter | none | `tracing`: audit event lost because the outbox write failed |
+| `security_audit_outbox_depth` | observable gauge | none | `tracing`: pending outbox rows, read on each export |
+| `security_audit_delivery_lag_seconds` | observable gauge (`s`) | none | `tracing`: age of the last delivered row; no sample before the first delivery |
+
+Example: `security_metric name=worker_capability_reject_total value=1 capability=envelope.v1`.
+
+Counter names are kept as they were; the OTel counters carry them unchanged, so a Prometheus-style exporter
+that appends `_total` may need a rename rule in the collector.

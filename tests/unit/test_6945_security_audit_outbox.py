@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pylon.core.tools import log
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase
 
@@ -405,12 +406,32 @@ def test_lag_is_none_before_any_delivery(sa):
     assert snapshot["security_audit_delivery_lag_seconds"] is None
 
 
-def test_counter(sa):
-    counter = sa.sa.Counter()
-    counter.inc()
-    counter.inc(2)
+def test_audit_gauges_use_the_audit_snapshot(sa, monkeypatch):
+    registered = {}
 
-    assert counter.total() == 3
+    class Recorder:
+        def gauge_callback(self, name, description, fn, unit="1"):
+            registered[name] = (fn, unit)
+
+    monkeypatch.setattr(sa.sa, "security_audit_metrics", lambda: {
+        "security_audit_outbox_depth": 4, "security_audit_delivery_lag_seconds": 12.5})
+
+    sa.sa.register_audit_gauges(Recorder())
+
+    assert set(registered) == {"security_audit_outbox_depth", "security_audit_delivery_lag_seconds"}
+    assert registered["security_audit_outbox_depth"][0]() == 4
+    assert registered["security_audit_delivery_lag_seconds"] == (registered["security_audit_delivery_lag_seconds"][0], "s")
+    assert registered["security_audit_delivery_lag_seconds"][0]() == 12.5
+
+
+def test_drop_counter_is_the_shared_helper(sa, monkeypatch):
+    lines = []
+    monkeypatch.setattr(log, "info", lines.append, raising=False)
+    before = sa.sa.security_audit_drop_total.total()
+    sa.sa.security_audit_drop_total.inc()
+
+    assert sa.sa.security_audit_drop_total.total() == before + 1
+    assert lines == ["security_metric name=security_audit_drop_total value=1"]
 
 
 def test_module_initialises_security_audit_before_the_tracing_enabled_gate(plugin_root):
