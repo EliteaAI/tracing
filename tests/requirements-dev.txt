@@ -2,3 +2,7 @@ pytest>=7.0.0
 # #6945 tests exercise the real pydantic model and the SQLAlchemy outbox query (runtime gets both from pylon)
 pydantic>=2.0
 sqlalchemy>=2.0
+# #7120 tests drive the Flask request hooks and the API handlers, and read spans back through the OTel SDK
+flask>=2.0
+opentelemetry-sdk>=1.20.0
+requests>=2.31.0

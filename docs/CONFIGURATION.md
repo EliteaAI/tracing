@@ -102,6 +102,9 @@ payload_capture:
   max_size: 4096               # Max size of serialized payload (characters)
   max_depth: 5                 # Max depth for nested structures
   additional_mask_keys: []     # Additional keys to mask (added to defaults)
+  skip_body_paths: []          # Extra request path prefixes whose body is never captured
+  # Always skipped, whatever is configured (write-only secret values): /api/v2/secrets/credential_material/
+  # Prefix match on the request path, query string ignored. The body is not even read for tracing.
   # Default masked keys: password, secret, token, api_key, authorization,
   # bearer, credential, session, cookie, private
 
@@ -292,8 +295,9 @@ metrics:
 
 Schema v1 security audit events (#6945, C-1009) live in the `security_audit_events` table, which is
 also the transactional outbox. It is independent of `enabled`, `audit_trail` and Langfuse. The table
-is created with `create_all` at plugin init in every pylon that loads this plugin; there is no SQL
-migration. Policy is operator config only and is deliberately absent from `admin_schema.json`.
+is created with `create_all` at plugin init in every pylon that loads this plugin. Columns added later
+(`would_deny`, #7120) are applied at init with an idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`;
+the same statements are in `migrations/006_add_would_deny_to_security_audit_events.sql`. Policy is operator config only and is deliberately absent from `admin_schema.json`.
 
 ```yaml
 security_audit:
@@ -321,3 +325,14 @@ security_audit:
 - In-process metrics: `utils.security_audit.security_audit_metrics()` returns
   `security_audit_outbox_depth`, `security_audit_delivery_lag_seconds` (age of the last delivered row)
   and `security_audit_drop_total`.
+- `would_deny` (optional bool, additive in v1; #7120): `true` = audit-only governance allowed the run but
+  enforce would have refused it with `reason_code`; `false` = audit-only checked it and enforce would allow;
+  `null` (omitted from the OCSF `unmapped` block) = an enforce or legacy event. Only a real bool is accepted.
+- Read API for operators (`models.admin.audit_trail.view`, administration mode: super admin and platform
+  admin; served wherever the outbox exists, independent of `register_api`):
+  - `GET /api/v2/tracing/security_audit/administration` filters `project_id, agent_binding_ref,
+    credential_ref, user_ref, event_type, reason_code, would_deny, date_from, date_to`; `limit` (default 20,
+    capped at 100), `offset`, `sort_by` (`occurred_at` default, `event_type`, `decision`, `reason_code`,
+    `project_id`), `sort_order`. Returns `{total, rows}` of schema v1 fields. Bad values are a 400 `INVALID_REQUEST`.
+  - `GET /api/v2/tracing/security_audit_summary/administration?since_hours=24[&would_deny=true]`
+    (`since_hours` 1..168) returns `[{decision, would_deny, reason_code, count}]`, one `GROUP BY`.
