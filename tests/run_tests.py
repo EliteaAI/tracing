@@ -44,7 +44,8 @@ def install_pylon_stubs():
     pylon_core_tools = types.ModuleType('pylon.core.tools')
 
     pylon_core_tools.log = _Log()
-    pylon_core_tools.web = types.SimpleNamespace(rpc=lambda *a, **k: lambda f: f)
+    pylon_core_tools.web = types.SimpleNamespace(
+        rpc=lambda *a, **k: lambda f: f, method=lambda *a, **k: lambda f: f)
     pylon_core_tools.module = types.SimpleNamespace()
 
     pylon.core = pylon_core

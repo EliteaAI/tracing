@@ -61,6 +61,7 @@ class Module(module.ModuleModel):
         self._audit_event_node = None
         # Security audit outbox relay (#6945)
         self._security_audit_relay = None
+        self._security_audit_available = False
         # Email cache moved to utils.user_context (service-level singleton)
 
     def init(self):
@@ -987,7 +988,10 @@ class Module(module.ModuleModel):
 
         settings = security_audit.SecurityAuditSettings.from_config(self.config.get('security_audit'))
         security_audit.configure(settings)
+        self._security_audit_available = True
         self.descriptor.init_rpcs()
+        # Other plugins call the security_audit_* methods whether or not tracing is enabled
+        self.descriptor.init_methods()
         try:
             from .models.security_audit_outbox import SecurityAuditEvent
 
