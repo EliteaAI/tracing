@@ -1212,7 +1212,10 @@ class Module(module.ModuleModel):
 
         Called by the plugin that owns the input guardrail so the tracing span
         of a chat message carries the redacted text, not the detected value.
-        Pass None to clear it.
+        The redactor is per process: every process that runs traced code with
+        user text (pylon_main, the indexer) registers its own.
+        It returns the text with detections replaced, or None when it could not
+        inspect it, in which case the whole value is masked. Pass None to clear it.
         """
         from .utils.payload_capture import register_value_redactor
         register_value_redactor(fn)
