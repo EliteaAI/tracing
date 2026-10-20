@@ -8,7 +8,7 @@ to a sink. Columns mirror ``SecurityAuditEventV1`` one to one.
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, func, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tools import db, config as c
@@ -25,6 +25,7 @@ class SecurityAuditEvent(db.Base):
         Index('ix_security_audit_events_project_occurred', 'project_id', 'occurred_at'),
         Index('ix_security_audit_events_run_id', 'run_id'),
         Index('ix_security_audit_events_credential_ref', 'credential_ref'),
+        Index('ix_security_audit_events_occurred', 'occurred_at'),
         Index('ux_security_audit_events_event_id', 'event_id', unique=True),
         {'schema': c.POSTGRES_SCHEMA},
     )
@@ -59,6 +60,7 @@ class SecurityAuditEvent(db.Base):
 
     decision: Mapped[str] = mapped_column(String(8), nullable=True)
     reason_code: Mapped[str] = mapped_column(String(64), nullable=True)
+    would_deny: Mapped[bool] = mapped_column(Boolean, nullable=True)
     policy_revision: Mapped[str] = mapped_column(String(256), nullable=True)
     revocation_epoch: Mapped[int] = mapped_column(BigInteger, nullable=True)
     approver_ref: Mapped[str] = mapped_column(String(256), nullable=True)

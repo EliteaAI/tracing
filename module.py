@@ -62,6 +62,7 @@ class Module(module.ModuleModel):
         # Security audit outbox relay (#6945)
         self._security_audit_relay = None
         self._security_audit_available = False
+        self._legacy_api = False
         # Email cache moved to utils.user_context (service-level singleton)
 
     def init(self):
@@ -71,7 +72,10 @@ class Module(module.ModuleModel):
         # Security audit is independent of the tracing and audit_trail flags (#6945)
         self._init_security_audit()
         # Determine if API endpoints should be registered (status/collect/otlp endpoints)
-        self._register_api = _API_TOOLS_IMPORTABLE and self.config.get('register_api', False)
+        # The security audit endpoints (#7120) are served wherever the outbox is; the older status,
+        # collect and otlp endpoints stay behind `register_api` (their handlers answer 404 otherwise).
+        self._legacy_api = _API_TOOLS_IMPORTABLE and self.config.get('register_api', False)
+        self._register_api = _API_TOOLS_IMPORTABLE and (self._legacy_api or self._security_audit_available)
 
         # Check if tracing is enabled via config
         self._enabled = self.config.get('enabled', False)
@@ -94,7 +98,7 @@ class Module(module.ModuleModel):
             log.info("Tracing plugin is DISABLED (set enabled: true in config or TRACING_ENABLED=true)")
             # Still register API for status endpoint (only if configured)
             if self._register_api:
-                self.descriptor.init_api()
+                self._init_api()
             return
 
         log.info("Tracing plugin is ENABLED - initializing OpenTelemetry...")
@@ -110,7 +114,7 @@ class Module(module.ModuleModel):
             log.error(f"Failed to initialize OpenTelemetry: {e}")
             self._enabled = False
             if self._register_api:
-                self.descriptor.init_api()
+                self._init_api()
             return
 
         # Setup metrics (MeterProvider for system/infra metrics)
@@ -127,7 +131,7 @@ class Module(module.ModuleModel):
 
         # Register components (API only if configured - skip on worker pylons)
         if self._register_api:
-            self.descriptor.init_api()
+            self._init_api()
         self.descriptor.init_methods()
 
         # NOTE: Flask auto-instrumentation (FlaskInstrumentor) is NOT used because
@@ -162,6 +166,22 @@ class Module(module.ModuleModel):
             self.descriptor.init_events()
 
         log.info("Tracing plugin initialization complete")
+
+    def _init_api(self):
+        """Register the API resources and document them in the OpenAPI registry."""
+        self.descriptor.init_api()
+        try:
+            from tools import openapi_registry  # pylint: disable=C0415
+            from .api import v2 as api_v2  # pylint: disable=C0415
+
+            openapi_registry.register_plugin(
+                plugin_name="tracing",
+                version=self.descriptor.metadata.get("version", "0.1"),
+                description="Tracing status and the security audit event views",
+                api_module=api_v2,
+            )
+        except Exception as e:  # pylint: disable=W0703
+            log.warning(f"Failed to register OpenAPI for tracing plugin: {e}")
 
     def ready(self):
         """Called after all plugins are initialized - instrument DB, RPC, and Flask here."""
@@ -996,6 +1016,7 @@ class Module(module.ModuleModel):
             from .models.security_audit_outbox import SecurityAuditEvent
 
             db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
+            security_audit.ensure_would_deny_column(db.engine, SecurityAuditEvent.__table__.schema)
         except Exception as e:
             log.warning(f"Security audit table could not be created/verified: {e}")
         if settings.relay_enabled:

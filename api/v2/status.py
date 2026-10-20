@@ -33,6 +33,9 @@ if _API_AVAILABLE:
             Returns:
                 dict: Tracing status including enabled state and configuration
             """
+            if not self.module._legacy_api:
+                return {"error": "Not found"}, 404
+
             return {
                 "enabled": self.module.enabled,
                 "config": self.module.get_config(),
@@ -55,6 +58,9 @@ if _API_AVAILABLE:
             Returns:
                 dict: Tracing status
             """
+            if not self.module._legacy_api:
+                return {"error": "Not found"}, 404
+
             return {
                 "enabled": self.module.enabled,
                 "project_id": project_id,

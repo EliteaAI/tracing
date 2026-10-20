@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 # OCSF classes: 3002 authentication, 3003 authorize session, 3004 entity management,
 # 6003 API activity.
@@ -94,6 +94,9 @@ class SecurityAuditEventV1(BaseModel):
 
     decision: Optional[Literal["allow", "deny"]] = None
     reason_code: Optional[str] = Field(default=None, max_length=64, pattern=REASON_CODE_PATTERN)
+    # Audit-only rehearsal (#7120): True = the run was allowed but enforce would have refused it
+    # with ``reason_code``. None = an enforce or legacy event. Strict: a string is rejected.
+    would_deny: Optional[StrictBool] = None
     policy_revision: Optional[str] = None
     revocation_epoch: Optional[int] = None
     approver_ref: Optional[str] = None

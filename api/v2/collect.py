@@ -35,6 +35,9 @@ if _API_AVAILABLE:
             Accepts trace spans from the browser and creates corresponding
             OpenTelemetry spans that will be exported to Jaeger.
             """
+            if not self.module._legacy_api:
+                return {"error": "Not found"}, 404
+
             if not self.module.enabled:
                 return {"error": "Tracing is disabled", "received": 0}, 503
 
