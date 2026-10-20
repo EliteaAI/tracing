@@ -1207,6 +1207,16 @@ class Module(module.ModuleModel):
         log.debug(f"flush_span_processors flushed {flushed}/{len(processors)} processor(s)")
         return flushed
 
+    def register_value_redactor(self, fn):
+        """Register a shared value redactor for captured span payloads (#6886).
+
+        Called by the plugin that owns the input guardrail so the tracing span
+        of a chat message carries the redacted text, not the detected value.
+        Pass None to clear it.
+        """
+        from .utils.payload_capture import register_value_redactor
+        register_value_redactor(fn)
+
     def get_task_wrapper(self):
         """
         Get a task wrapper factory for wrapping arbiter task handlers.

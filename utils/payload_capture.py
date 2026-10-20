@@ -16,7 +16,7 @@ Usage:
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 
 # Default sensitive keys to mask (case-insensitive matching)
@@ -33,6 +33,17 @@ DEFAULT_MAX_SIZE = 4096
 # Mask replacement
 MASK_VALUE = "***MASKED***"
 TRUNCATED_SUFFIX = "...[TRUNCATED]"
+
+# Optional value redactor registered by another plugin (#6886 input guardrail).
+# It takes a string and returns it with detected values replaced in place, so a
+# span keeps the readable part of a message instead of a whole-value mask.
+_value_redactor: Optional[Callable[[str], str]] = None
+
+
+def register_value_redactor(fn: Optional[Callable[[str], str]]) -> None:
+    """Register (or clear, with None) the shared value redactor used for every capture."""
+    global _value_redactor
+    _value_redactor = fn
 
 
 class PayloadCapture:
@@ -123,6 +134,15 @@ class PayloadCapture:
         if not isinstance(value, str):
             return value
 
+        if _value_redactor is not None:
+            try:
+                redacted = _value_redactor(value)
+                if isinstance(redacted, str):
+                    value = redacted
+            except Exception:
+                # A broken redactor must never leak the value: the patterns below still apply
+                pass
+
         # Check against patterns
         for pattern in self.mask_patterns:
             if pattern.search(value):
@@ -154,10 +174,10 @@ class PayloadCapture:
             return value
 
         if isinstance(value, str):
-            # Mask if matches patterns
-            masked = self._mask_value(value)
-            if masked != value:
-                return masked
+            # Redact detected values, or mask the whole value if it matches a pattern
+            value = self._mask_value(value)
+            if value == MASK_VALUE:
+                return value
             # Truncate long strings
             if len(value) > 500:
                 return value[:500] + "...[truncated]"
