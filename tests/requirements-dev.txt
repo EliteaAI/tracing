@@ -2,3 +2,5 @@ pytest>=7.0.0
 # #6945 tests exercise the real pydantic model and the SQLAlchemy outbox query (runtime gets both from pylon)
 pydantic>=2.0
 sqlalchemy>=2.0
+# C-1009 security metrics tests read the counters back through the OTel SDK in-memory reader
+opentelemetry-sdk>=1.20.0
