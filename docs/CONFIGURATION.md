@@ -324,7 +324,9 @@ security_audit:
   `backlog_limit` (count cached for 5 s; an unreadable count is treated as exceeded). Nothing calls it yet.
 - In-process metrics: `utils.security_audit.security_audit_metrics()` returns
   `security_audit_outbox_depth` (rows not delivered: pending or failed), `security_audit_delivery_lag_seconds`
-  (age of the oldest undelivered row, 0 when none) and `security_audit_drop_total`.
+  (age of the oldest undelivered row, 0 when none) and `security_audit_drop_total`. Both gauges are read
+  with one statement served by the partial index `ix_security_audit_events_undelivered` (`occurred_at` where
+  `delivery_state IN ('pending', 'failed')`), created idempotently at startup on PostgreSQL; migration 007.
 - `would_deny` (optional bool, additive in v1; #7120): `true` = audit-only governance allowed the run but
   enforce would have refused it with `reason_code`; `false` = audit-only checked it and enforce would allow;
   `null` (omitted from the OCSF `unmapped` block) = an enforce or legacy event. Only a real bool is accepted.

@@ -63,6 +63,7 @@ class Module(module.ModuleModel):
         # Security audit outbox relay (#6945)
         self._security_audit_relay = None
         self._security_audit_available = False
+        self._security_metrics_registered = False
         self._legacy_api = False
         # Email cache moved to utils.user_context (service-level singleton)
 
@@ -73,6 +74,7 @@ class Module(module.ModuleModel):
         # Security metrics and audit are independent of the tracing and audit_trail flags (#6754, #6945)
         try:
             self.descriptor.register_tool("security_metrics", SECURITY_METRICS)
+            self._security_metrics_registered = True
         except Exception as e:  # a repeated init or a name clash must not abort tracing init
             log.warning(f"security_metrics tool could not be registered: {type(e).__name__}")
         self._init_security_audit()
@@ -1026,6 +1028,7 @@ class Module(module.ModuleModel):
 
             db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
             security_audit.ensure_would_deny_column(db.engine, SecurityAuditEvent.__table__.schema)
+            security_audit.ensure_undelivered_index(db.engine, SecurityAuditEvent.__table__.schema)
         except Exception as e:
             log.warning(f"Security audit table could not be created/verified: {e}")
         if settings.relay_enabled:
@@ -1340,10 +1343,13 @@ class Module(module.ModuleModel):
 
     def deinit(self):
         """Cleanup tracing resources."""
-        try:
-            self.descriptor.unregister_tool("security_metrics")
-        except Exception as e:
-            log.warning(f"Error unregistering security_metrics tool: {e}")
+        # Only the tool this module registered: a failed registration must not remove another plugin's tool
+        if getattr(self, "_security_metrics_registered", False):
+            try:
+                self.descriptor.unregister_tool("security_metrics")
+                self._security_metrics_registered = False
+            except Exception as e:
+                log.warning(f"Error unregistering security_metrics tool: {e}")
 
         if self._security_audit_relay:
             try:

@@ -407,6 +407,56 @@ def test_undelivered_means_pending_or_failed(sa):
     assert set(sa.sa.UNDELIVERED_STATES) == {"pending", "failed"}
 
 
+class DdlEngine:
+    def __init__(self, dialect="postgresql"):
+        self.dialect = types.SimpleNamespace(name=dialect)
+        self.statements = []
+
+    def begin(self):
+        engine = self
+
+        class Scope:
+            def __enter__(self):
+                return types.SimpleNamespace(execute=lambda statement: engine.statements.append(str(statement)))
+
+            def __exit__(self, *exc):
+                return False
+        return Scope()
+
+
+def test_the_partial_index_ddl_matches_the_gauge_filter(sa):
+    engine = DdlEngine()
+    sa.sa.ensure_undelivered_index(engine, 'cen"try')
+
+    assert engine.statements == [
+        'CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered ON "cen""try".security_audit_events '
+        "(occurred_at) WHERE delivery_state IN ('pending', 'failed')"]
+    # the gauge statement filters on exactly the states of the index predicate
+    session = FakeSession()
+    session.execute = lambda statement: (session.statements.append(statement),
+                                         types.SimpleNamespace(one=lambda: (0, None)))[1]
+    sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
+    gauge_sql = str(session.statements[0].compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert gauge_sql.count("delivery_state IN ('pending', 'failed')") == 2
+    assert sa.sa.undelivered_predicate_sql() == "delivery_state IN ('pending', 'failed')"
+
+
+def test_the_partial_index_is_skipped_outside_postgresql(sa):
+    engine = DdlEngine("sqlite")
+
+    sa.sa.ensure_undelivered_index(engine, "main")
+
+    assert engine.statements == []
+
+
+def test_the_partial_index_migration_carries_the_same_statement(plugin_root):
+    sql = (plugin_root / "migrations" / "007_add_undelivered_index_to_security_audit_events.sql").read_text()
+
+    assert "CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered" in sql
+    assert "(occurred_at)" in sql and "WHERE delivery_state IN ('pending', 'failed')" in sql
+
+
 def test_lag_is_zero_when_nothing_is_undelivered(sa):
     session = FakeSession(scalar=None)
 

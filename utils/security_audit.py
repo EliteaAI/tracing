@@ -189,8 +189,8 @@ def security_audit_metrics(*, session_scope=None, now: Optional[datetime] = None
     """Undelivered outbox depth, age of the oldest undelivered row, and dropped-event total.
 
     The age is 0 when nothing is undelivered, so it does not grow on an idle outbox and does grow
-    when the relay is dead. One statement; both subqueries filter on ``delivery_state`` and use
-    ``ix_security_audit_events_delivery``.
+    when the relay is dead. One statement; both subqueries filter on ``UNDELIVERED_STATES``, which is
+    the predicate of the partial index ``ix_security_audit_events_undelivered`` (``ensure_undelivered_index``).
     """
     now = now or datetime.now(timezone.utc)
     undelivered = SecurityAuditEvent.delivery_state.in_(UNDELIVERED_STATES)
@@ -221,6 +221,28 @@ def ensure_would_deny_column(engine, schema: str) -> None:
         connection.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS would_deny BOOLEAN"))
         connection.execute(text(
             f"CREATE INDEX IF NOT EXISTS ix_security_audit_events_occurred ON {table} (occurred_at)"))
+
+
+def undelivered_predicate_sql() -> str:
+    """``delivery_state IN ('pending', 'failed')``: the gauge filter and the partial index predicate."""
+    return "delivery_state IN (%s)" % ", ".join("'%s'" % state for state in UNDELIVERED_STATES)
+
+
+def ensure_undelivered_index(engine, schema: str) -> None:
+    """Partial index for the outbox gauges: ``min(occurred_at)`` and ``count(*)`` over undelivered rows.
+
+    ``ix_security_audit_events_delivery`` is ``(delivery_state, next_attempt_at)`` and cannot answer
+    ``min(occurred_at)``; delivered rows are never purged, so without this the gauge query would walk them.
+    PostgreSQL only (partial index); idempotent; the same statement is in
+    ``migrations/007_add_undelivered_index_to_security_audit_events.sql``.
+    """
+    if getattr(getattr(engine, "dialect", None), "name", None) != "postgresql":
+        return
+    table = '"%s".security_audit_events' % schema.replace('"', '""')
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered ON {table} (occurred_at) "
+            f"WHERE {undelivered_predicate_sql()}"))
 
 
 # ========================

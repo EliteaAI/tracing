@@ -356,16 +356,39 @@ def test_a_failing_register_tool_does_not_abort_init(tracing_module):
     assert calls == ["audit"]
 
 
-def test_deinit_unregisters_the_tool(tracing_module):
+def test_deinit_unregisters_the_tool_it_registered(tracing_module):
     names = []
-    descriptor = types.SimpleNamespace(unregister_tool=names.append)
-    plugin = types.SimpleNamespace(descriptor=descriptor, _security_audit_relay=None)
+    descriptor = types.SimpleNamespace(
+        config={}, register_tool=lambda name, tool: None, unregister_tool=names.append)
+    plugin, _ = fake_plugin(tracing_module, descriptor)
+    plugin._security_audit_relay = None
+    tracing_module.Module.init(plugin)
+
     try:
         tracing_module.Module.deinit(plugin)
     except AttributeError:
         pass  # the rest of deinit needs the full plugin state; the tool is released first
 
-    assert names == ["security_metrics"]
+    assert names == ["security_metrics"] and plugin._security_metrics_registered is False
+
+
+def test_deinit_leaves_a_tool_it_did_not_register(tracing_module):
+    names = []
+
+    def clash(name, tool):
+        raise RuntimeError("tool already registered")
+
+    descriptor = types.SimpleNamespace(config={}, register_tool=clash, unregister_tool=names.append)
+    plugin, _ = fake_plugin(tracing_module, descriptor)
+    plugin._security_audit_relay = None
+    tracing_module.Module.init(plugin)
+
+    try:
+        tracing_module.Module.deinit(plugin)
+    except AttributeError:
+        pass
+
+    assert names == []
 
 
 def test_contract_with_the_consumer_copies(sm, otel, lines):
