@@ -6,19 +6,27 @@ keeps an in-process total per label set, and writes one structured INFO log line
 
     security_metric name=<name> value=<n> <label>=<value> ...
 
-Label order is the declaration order. Values are reason codes, capability names or ids,
-never secrets; they are reduced to a single token so a value cannot forge extra fields.
+Label order is the declaration order. Values are reason codes or capability names, never
+secrets or identifiers; they are reduced to a single token so a value cannot forge extra fields,
+and the label keys are limited to ``ALLOWED_LABEL_KEYS``. The log line is rate-capped per counter
+and label set (``LOG_INTERVAL_S``): increments inside the window are folded into ``value`` of the
+next line. The OpenTelemetry counter and the in-process total always see every increment.
 The instance is published as ``tools.security_metrics`` by the tracing plugin; consumer
 plugins keep a local fallback with the same interface (see their ``security_metrics_client``).
 """
 
 import re
 import threading
+import time
 
 from pylon.core.tools import log
 
 METER_NAME = "elitea.security"
 MAX_LABEL_VALUE_LEN = 64
+# The only label keys a security counter may declare; values are enum-like codes (#6754).
+ALLOWED_LABEL_KEYS = frozenset({"capability"})
+# At most one INFO line per counter and label set in this window; the rest is folded into ``value``.
+LOG_INTERVAL_S = 10.0
 _UNSAFE = re.compile(r"[^A-Za-z0-9_.:/@+-]")
 
 
@@ -37,10 +45,14 @@ def format_line(name, value, labels) -> str:
 class SecurityCounter:
     """Monotonic counter with a fixed label set."""
 
-    def __init__(self, name, description, labels, instrument_getter):
+    def __init__(self, name, description, labels, instrument_getter, clock=time.monotonic):
         self.name = name
         self.description = description
         self.labels = tuple(labels)
+        if not set(self.labels) <= ALLOWED_LABEL_KEYS:
+            raise ValueError(f"{name}: labels {sorted(set(self.labels) - ALLOWED_LABEL_KEYS)} are not allowed")
+        self._clock = clock
+        self._log_state = {}  # label values -> (time of the last line, increments not logged yet)
         self._instrument_getter = instrument_getter
         self._instrument = None
         self._lock = threading.Lock()
@@ -53,6 +65,7 @@ class SecurityCounter:
         key = tuple(clean.values())
         with self._lock:
             self._totals[key] = self._totals.get(key, 0) + value
+            to_log = self._take_log_value(key, value)
         # Recording must never break the security path it describes.
         try:
             if self._instrument is None:
@@ -60,10 +73,22 @@ class SecurityCounter:
             self._instrument.add(value, clean)
         except Exception as exc:  # pylint: disable=W0718
             log.debug("security_metric %s: OpenTelemetry export failed: %s", self.name, exc)
-        try:
-            log.info(format_line(self.name, value, clean))
-        except Exception:  # pylint: disable=W0718
-            pass
+        if to_log:
+            try:
+                log.info(format_line(self.name, to_log, clean))
+            except Exception:  # pylint: disable=W0718
+                pass
+
+    def _take_log_value(self, key, value) -> int:
+        """The ``value`` of the line to write now, or 0 inside the rate-cap window (caller holds the lock)."""
+        now = self._clock()
+        last, pending = self._log_state.get(key, (None, 0))
+        pending += value
+        if last is not None and now - last < LOG_INTERVAL_S:
+            self._log_state[key] = (last, pending)
+            return 0
+        self._log_state[key] = (now, 0)
+        return pending
 
     def total(self, **labels) -> int:
         """Sum over every label set that matches the given (possibly partial) labels."""
@@ -76,8 +101,9 @@ class SecurityCounter:
 class SecurityMetrics:
     """Registry of security counters and observable gauges."""
 
-    def __init__(self, meter_getter=None):
+    def __init__(self, meter_getter=None, clock=time.monotonic):
         self._meter_getter = meter_getter or self._global_meter
+        self._clock = clock
         self._lock = threading.Lock()
         self._counters = {}
         self._gauges = {}
@@ -96,7 +122,7 @@ class SecurityMetrics:
             existing = self._counters.get(name)
             if existing is None:
                 existing = self._counters[name] = SecurityCounter(
-                    name, description, labels, self._create_counter)
+                    name, description, labels, self._create_counter, self._clock)
             elif existing.labels != tuple(labels):
                 raise ValueError(f"{name} already registered with labels {list(existing.labels)}")
             return existing

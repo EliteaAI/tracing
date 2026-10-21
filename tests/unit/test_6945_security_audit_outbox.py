@@ -61,6 +61,7 @@ class FakeSession:
             scalars=lambda: types.SimpleNamespace(all=lambda: self.rows),
             scalar_one=lambda: self.scalar,
             scalar_one_or_none=lambda: self.scalar,
+            one=lambda: (self.scalar, self.scalar),
         )
 
 
@@ -388,11 +389,14 @@ def test_metrics_snapshot(sa):
     class Session(FakeSession):
         def execute(self, statement):
             self.statements.append(statement)
-            value = 7 if "count" in str(statement).lower() else NOW - timedelta(seconds=30)
-            return types.SimpleNamespace(scalar_one=lambda: value, scalar_one_or_none=lambda: value)
+            return types.SimpleNamespace(one=lambda: (7, NOW - timedelta(seconds=30)))
 
-    snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(Session()), now=NOW)
+    session = Session()
+    snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
 
+    assert len(session.statements) == 1  # depth and lag are read with one query
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect())).lower()
+    assert sql.count("select") == 3 and "count(" in sql and "max(" in sql
     assert snapshot["security_audit_outbox_depth"] == 7
     assert snapshot["security_audit_delivery_lag_seconds"] == 30
     assert snapshot["security_audit_drop_total"] == sa.sa.security_audit_drop_total.total()
@@ -424,9 +428,33 @@ def test_audit_gauges_use_the_audit_snapshot(sa, monkeypatch):
     assert registered["security_audit_delivery_lag_seconds"][0]() == 12.5
 
 
+def test_both_gauges_share_one_reading_per_export(sa, monkeypatch):
+    registered, reads = {}, []
+
+    class Recorder:
+        def gauge_callback(self, name, description, fn, unit="1"):
+            registered[name] = fn
+
+    def reading():
+        reads.append(1)
+        return {"security_audit_outbox_depth": 4, "security_audit_delivery_lag_seconds": 2.5}
+
+    clock = Clock()
+    monkeypatch.setattr(sa.sa, "security_audit_metrics", reading)
+    sa.sa.register_audit_gauges(Recorder(), clock=clock)
+
+    assert registered["security_audit_outbox_depth"]() == 4
+    assert registered["security_audit_delivery_lag_seconds"]() == 2.5
+    assert len(reads) == 1
+    clock.t += sa.sa.GAUGE_SNAPSHOT_TTL_S
+    registered["security_audit_outbox_depth"]()
+    assert len(reads) == 2
+
+
 def test_drop_counter_is_the_shared_helper(sa, monkeypatch):
     lines = []
     monkeypatch.setattr(log, "info", lines.append, raising=False)
+    monkeypatch.setattr(sa.sa.security_audit_drop_total, "_log_state", {})  # no earlier line inside the window
     before = sa.sa.security_audit_drop_total.total()
     sa.sa.security_audit_drop_total.inc()
 

@@ -44,7 +44,8 @@ def install_pylon_stubs():
     pylon_core_tools = types.ModuleType('pylon.core.tools')
 
     pylon_core_tools.log = _Log()
-    pylon_core_tools.web = types.SimpleNamespace(rpc=lambda *a, **k: lambda f: f)
+    pylon_core_tools.web = types.SimpleNamespace(
+        rpc=lambda *a, **k: lambda f: f, method=lambda *a, **k: lambda f: f)
     pylon_core_tools.module = types.SimpleNamespace()
 
     pylon.core = pylon_core
@@ -69,12 +70,15 @@ def install_pylon_stubs():
     )
     sys.modules.setdefault('tools', tools)
 
-    # Stub flask
-    flask = types.ModuleType('flask')
-    flask.request = types.SimpleNamespace(headers={})
-    flask.g = types.SimpleNamespace()
-    flask.has_request_context = lambda: False
-    sys.modules.setdefault('flask', flask)
+    # Use the real Flask when installed (the HTTP hook and API tests need it); stub it otherwise
+    try:
+        import flask  # noqa: F401
+    except ImportError:
+        flask = types.ModuleType('flask')
+        flask.request = types.SimpleNamespace(headers={})
+        flask.g = types.SimpleNamespace()
+        flask.has_request_context = lambda: False
+        sys.modules.setdefault('flask', flask)
 
 
 if __name__ == '__main__':

@@ -16,7 +16,7 @@ Usage:
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 
 # Default sensitive keys to mask (case-insensitive matching)
@@ -27,12 +27,35 @@ DEFAULT_SENSITIVE_KEYS = {
     'cookie', 'x-api-key', 'x-auth-token', 'jwt', 'key', 'cert', 'certificate',
 }
 
+# Request paths whose body is never captured, whatever the masking rules say: the body carries
+# a value that must not reach spans or logs (the write-only personal credential material, #7120).
+# Matched as a prefix of the request path; the query string is ignored. Configured
+# ``skip_body_paths`` extend this list and cannot remove entries.
+DEFAULT_SKIP_BODY_PATHS = ('/api/v2/secrets/credential_material/',)
+
 # Default max payload size in characters
 DEFAULT_MAX_SIZE = 4096
 
 # Mask replacement
 MASK_VALUE = "***MASKED***"
 TRUNCATED_SUFFIX = "...[TRUNCATED]"
+
+# Optional value redactor registered by another plugin (#6886 input guardrail).
+# It takes a string and returns it with detected values replaced in place, so a
+# span keeps the readable part of a message instead of a whole-value mask.
+# Contract: it returns None when it could not inspect the value (oversize, timeout,
+# internal error); the whole value is then masked. Raising has the same effect.
+_value_redactor: Optional[Callable[[str], Optional[str]]] = None
+
+# The shortest value any guardrail rule can detect is a 6-char email ("a@b.co").
+# Shorter strings (ids, flags, enum values: most leaves of a payload) skip the redactor.
+MIN_REDACT_LENGTH = 6
+
+
+def register_value_redactor(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    """Register (or clear, with None) the shared value redactor used for every capture."""
+    global _value_redactor
+    _value_redactor = fn
 
 
 class PayloadCapture:
@@ -54,6 +77,7 @@ class PayloadCapture:
         additional_mask_keys: Optional[Set[str]] = None,
         mask_patterns: Optional[List[str]] = None,
         include_types: bool = True,
+        skip_body_paths: Optional[Iterable[str]] = None,
     ):
         """
         Initialize the payload capture utility.
@@ -65,7 +89,11 @@ class PayloadCapture:
             additional_mask_keys: Additional keys to mask (added to defaults)
             mask_patterns: Regex patterns for values to mask (e.g., API key patterns)
             include_types: Include type info for non-serializable objects
+            skip_body_paths: Request path prefixes whose body is never captured
+                (added to DEFAULT_SKIP_BODY_PATHS)
         """
+        self.skip_body_paths = tuple(dict.fromkeys(
+            (*DEFAULT_SKIP_BODY_PATHS, *(p for p in (skip_body_paths or ()) if p))))
         self.max_size = max_size
         self.max_depth = max_depth
         self.include_types = include_types
@@ -90,6 +118,11 @@ class PayloadCapture:
 
         # Add default patterns for common secrets
         self._add_default_patterns()
+
+    def skips_body(self, path: str) -> bool:
+        """True when the request body on ``path`` must not be captured (prefix match, query ignored)."""
+        path = re.sub(r'/{2,}', '/', (path or '').split('?', 1)[0].split('#', 1)[0])
+        return any(path.startswith(prefix) for prefix in self.skip_body_paths)
 
     def _add_default_patterns(self):
         """Add default regex patterns for common secret formats."""
@@ -123,6 +156,22 @@ class PayloadCapture:
         if not isinstance(value, str):
             return value
 
+        # Already masked (by key or by an earlier pass): nothing left to inspect
+        if value == MASK_VALUE:
+            return value
+
+        redactor = _value_redactor
+        if redactor is not None and len(value) >= MIN_REDACT_LENGTH:
+            try:
+                redacted = redactor(value)
+            except Exception:
+                # A broken redactor must never leak the value
+                return MASK_VALUE
+            if not isinstance(redacted, str):
+                # None = the redactor could not inspect the value: it may hold a secret
+                return MASK_VALUE
+            value = redacted
+
         # Check against patterns
         for pattern in self.mask_patterns:
             if pattern.search(value):
@@ -154,10 +203,10 @@ class PayloadCapture:
             return value
 
         if isinstance(value, str):
-            # Mask if matches patterns
-            masked = self._mask_value(value)
-            if masked != value:
-                return masked
+            # Redact detected values, or mask the whole value if it matches a pattern
+            value = self._mask_value(value)
+            if value == MASK_VALUE:
+                return value
             # Truncate long strings
             if len(value) > 500:
                 return value[:500] + "...[truncated]"
@@ -349,6 +398,7 @@ def get_payload_capture(config: Optional[dict] = None) -> PayloadCapture:
             - max_size: int
             - max_depth: int
             - additional_mask_keys: list
+            - skip_body_paths: list of request path prefixes whose body is never captured
 
     Returns:
         PayloadCapture instance
@@ -360,6 +410,7 @@ def get_payload_capture(config: Optional[dict] = None) -> PayloadCapture:
             max_size=config.get('max_size', DEFAULT_MAX_SIZE),
             max_depth=config.get('max_depth', 5),
             additional_mask_keys=set(config.get('additional_mask_keys', [])),
+            skip_body_paths=config.get('skip_body_paths'),
         )
 
     if _default_capture is None:

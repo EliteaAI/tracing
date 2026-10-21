@@ -36,6 +36,9 @@ if _API_AVAILABLE:
             Accepts trace data from browser OpenTelemetry SDK and forwards
             it to the configured Jaeger/OTLP endpoint.
             """
+            if not self.module._legacy_api:
+                return {"error": "Not found"}, 404
+
             if not self.module.enabled:
                 return {"error": "Tracing is disabled"}, 503
 

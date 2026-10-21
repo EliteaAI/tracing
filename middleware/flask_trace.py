@@ -137,8 +137,9 @@ class FlaskTraceHooks:
                     payload_attrs = capture.serialize_http_request(query_params=query_dict)
                     attributes.update(payload_attrs)
 
-                # Capture request body (for POST/PUT/PATCH)
-                if method in ('POST', 'PUT', 'PATCH'):
+                # Capture request body (for POST/PUT/PATCH), except on paths whose body is never
+                # captured (write-only secret values): the body is not even read here.
+                if method in ('POST', 'PUT', 'PATCH') and not capture.skips_body(path):
                     try:
                         # Read raw body once and restore the stream for downstream handlers
                         # This is critical for pylon exposure forwarding to work correctly
