@@ -16,7 +16,7 @@ Usage:
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 
 # Default sensitive keys to mask (case-insensitive matching)
@@ -33,6 +33,23 @@ DEFAULT_MAX_SIZE = 4096
 # Mask replacement
 MASK_VALUE = "***MASKED***"
 TRUNCATED_SUFFIX = "...[TRUNCATED]"
+
+# Optional value redactor registered by another plugin (#6886 input guardrail).
+# It takes a string and returns it with detected values replaced in place, so a
+# span keeps the readable part of a message instead of a whole-value mask.
+# Contract: it returns None when it could not inspect the value (oversize, timeout,
+# internal error); the whole value is then masked. Raising has the same effect.
+_value_redactor: Optional[Callable[[str], Optional[str]]] = None
+
+# The shortest value any guardrail rule can detect is a 6-char email ("a@b.co").
+# Shorter strings (ids, flags, enum values: most leaves of a payload) skip the redactor.
+MIN_REDACT_LENGTH = 6
+
+
+def register_value_redactor(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    """Register (or clear, with None) the shared value redactor used for every capture."""
+    global _value_redactor
+    _value_redactor = fn
 
 
 class PayloadCapture:
@@ -123,6 +140,22 @@ class PayloadCapture:
         if not isinstance(value, str):
             return value
 
+        # Already masked (by key or by an earlier pass): nothing left to inspect
+        if value == MASK_VALUE:
+            return value
+
+        redactor = _value_redactor
+        if redactor is not None and len(value) >= MIN_REDACT_LENGTH:
+            try:
+                redacted = redactor(value)
+            except Exception:
+                # A broken redactor must never leak the value
+                return MASK_VALUE
+            if not isinstance(redacted, str):
+                # None = the redactor could not inspect the value: it may hold a secret
+                return MASK_VALUE
+            value = redacted
+
         # Check against patterns
         for pattern in self.mask_patterns:
             if pattern.search(value):
@@ -154,10 +187,10 @@ class PayloadCapture:
             return value
 
         if isinstance(value, str):
-            # Mask if matches patterns
-            masked = self._mask_value(value)
-            if masked != value:
-                return masked
+            # Redact detected values, or mask the whole value if it matches a pattern
+            value = self._mask_value(value)
+            if value == MASK_VALUE:
+                return value
             # Truncate long strings
             if len(value) > 500:
                 return value[:500] + "...[truncated]"
