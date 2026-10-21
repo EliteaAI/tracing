@@ -10,7 +10,8 @@ Label order is the declaration order. Values are reason codes or capability name
 secrets or identifiers; they are reduced to a single token so a value cannot forge extra fields,
 and the label keys are limited to ``ALLOWED_LABEL_KEYS``. The log line is rate-capped per counter
 and label set (``LOG_INTERVAL_S``): increments inside the window are folded into ``value`` of the
-next line. The OpenTelemetry counter and the in-process total always see every increment.
+next line, and one flush is scheduled at the end of the window so a burst that stops is still logged.
+The OpenTelemetry counter and the in-process total always see every increment.
 The instance is published as ``tools.security_metrics`` by the tracing plugin; consumer
 plugins keep a local fallback with the same interface (see their ``security_metrics_client``).
 """
@@ -30,6 +31,25 @@ LOG_INTERVAL_S = 10.0
 _UNSAFE = re.compile(r"[^A-Za-z0-9_.:/@+-]")
 
 
+def schedule_flush(delay, fn) -> None:
+    """Run ``fn`` once after ``delay`` seconds: a greenlet when gevent is patched in, else a daemon timer."""
+    try:
+        from gevent import monkey, spawn_later  # pylint: disable=C0415
+        if monkey.is_module_patched("threading"):
+            spawn_later(delay, fn)
+            return
+    except ImportError:
+        pass
+    timer = threading.Timer(delay, fn)
+    timer.daemon = True
+    timer.start()
+
+
+def is_count(value) -> bool:
+    """An increment is a positive int (bool excluded), so a folded ``value`` is never <= 0."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def label_value(value) -> str:
     """One log/metric token: unsafe characters become ``_`` and the length is bounded."""
     return _UNSAFE.sub("_", str(value))[:MAX_LABEL_VALUE_LEN] or "-"
@@ -45,50 +65,87 @@ def format_line(name, value, labels) -> str:
 class SecurityCounter:
     """Monotonic counter with a fixed label set."""
 
-    def __init__(self, name, description, labels, instrument_getter, clock=time.monotonic):
+    def __init__(self, name, description, labels, instrument_getter, clock=time.monotonic, scheduler=None):
         self.name = name
         self.description = description
         self.labels = tuple(labels)
         if not set(self.labels) <= ALLOWED_LABEL_KEYS:
             raise ValueError(f"{name}: labels {sorted(set(self.labels) - ALLOWED_LABEL_KEYS)} are not allowed")
         self._clock = clock
-        self._log_state = {}  # label values -> (time of the last line, increments not logged yet)
+        self._scheduler = scheduler
+        # label values -> [time of the last line, increments not logged yet, flush scheduled]
+        self._log_state = {}
         self._instrument_getter = instrument_getter
         self._instrument = None
         self._lock = threading.Lock()
         self._totals = {}
 
     def inc(self, value=1, **labels) -> None:
+        if not is_count(value):
+            return
         if set(labels) != set(self.labels):
             raise ValueError(f"{self.name} takes labels {list(self.labels)}, got {sorted(labels)}")
         clean = {key: label_value(labels[key]) for key in self.labels}
         key = tuple(clean.values())
         with self._lock:
             self._totals[key] = self._totals.get(key, 0) + value
-            to_log = self._take_log_value(key, value)
+            to_log, flush_in = self._admit(key, value)
         # Recording must never break the security path it describes.
         try:
             if self._instrument is None:
                 self._instrument = self._instrument_getter(self.name, self.description)
             self._instrument.add(value, clean)
         except Exception as exc:  # pylint: disable=W0718
-            log.debug("security_metric %s: OpenTelemetry export failed: %s", self.name, exc)
+            log.debug("security_metric %s: OpenTelemetry export failed: %s", self.name, type(exc).__name__)
         if to_log:
-            try:
-                log.info(format_line(self.name, to_log, clean))
-            except Exception:  # pylint: disable=W0718
-                pass
+            self._write(to_log, clean)
+        if flush_in is not None:
+            self._arm(flush_in, key)
 
-    def _take_log_value(self, key, value) -> int:
-        """The ``value`` of the line to write now, or 0 inside the rate-cap window (caller holds the lock)."""
+    def _admit(self, key, value):
+        """``(value of the line to write now or 0, delay of the flush to schedule or None)``; caller holds the lock."""
         now = self._clock()
-        last, pending = self._log_state.get(key, (None, 0))
-        pending += value
-        if last is not None and now - last < LOG_INTERVAL_S:
-            self._log_state[key] = (last, pending)
-            return 0
-        self._log_state[key] = (now, 0)
-        return pending
+        state = self._log_state.setdefault(key, [None, 0, False])
+        state[1] += value
+        if state[0] is not None and now - state[0] < LOG_INTERVAL_S:
+            if state[2]:
+                return 0, None
+            state[2] = True
+            return 0, state[0] + LOG_INTERVAL_S - now
+        state[0], to_log, state[1] = now, state[1], 0
+        return to_log, None
+
+    def _write(self, value, clean) -> None:
+        try:
+            log.info(format_line(self.name, value, clean))
+        except Exception:  # pylint: disable=W0718
+            pass
+
+    def _arm(self, delay, key) -> None:
+        """Schedule the end-of-window flush of one label set (already marked as scheduled)."""
+        try:
+            (self._scheduler or schedule_flush)(delay, lambda: self._flush(key))
+        except Exception:  # pylint: disable=W0718
+            with self._lock:
+                self._log_state[key][2] = False
+
+    def _flush(self, key) -> None:
+        """Log what the window held back; wait out the rest of the window if a line was written meanwhile."""
+        with self._lock:
+            state = self._log_state[key]
+            now = self._clock()
+            if state[1] == 0:
+                state[2] = False
+                return
+            if now - state[0] < LOG_INTERVAL_S:
+                delay, to_log = state[0] + LOG_INTERVAL_S - now, 0
+            else:
+                delay, to_log = None, state[1]
+                state[0], state[1], state[2] = now, 0, False
+        if to_log:
+            self._write(to_log, dict(zip(self.labels, key)))
+        else:
+            self._arm(delay, key)
 
     def total(self, **labels) -> int:
         """Sum over every label set that matches the given (possibly partial) labels."""
@@ -101,9 +158,10 @@ class SecurityCounter:
 class SecurityMetrics:
     """Registry of security counters and observable gauges."""
 
-    def __init__(self, meter_getter=None, clock=time.monotonic):
+    def __init__(self, meter_getter=None, clock=time.monotonic, scheduler=None):
         self._meter_getter = meter_getter or self._global_meter
         self._clock = clock
+        self._scheduler = scheduler
         self._lock = threading.Lock()
         self._counters = {}
         self._gauges = {}
@@ -122,7 +180,7 @@ class SecurityMetrics:
             existing = self._counters.get(name)
             if existing is None:
                 existing = self._counters[name] = SecurityCounter(
-                    name, description, labels, self._create_counter, self._clock)
+                    name, description, labels, self._create_counter, self._clock, self._scheduler)
             elif existing.labels != tuple(labels):
                 raise ValueError(f"{name} already registered with labels {list(existing.labels)}")
             return existing
@@ -135,7 +193,7 @@ class SecurityMetrics:
             try:
                 value = fn()
             except Exception as exc:  # pylint: disable=W0718
-                log.debug("security_metric %s: gauge callback failed: %s", name, exc)
+                log.debug("security_metric %s: gauge callback failed: %s", name, type(exc).__name__)
                 return []
             return [] if value is None else [Observation(value)]
 

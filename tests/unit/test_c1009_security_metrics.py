@@ -27,6 +27,10 @@ def lines(monkeypatch):
     return captured
 
 
+# What this plugin declares: metric name -> label keys (the gauges are registered by register_audit_gauges).
+DECLARED = {"security_audit_drop_total": ()}
+
+
 class Clock:
     def __init__(self):
         self.t = 1000.0
@@ -39,9 +43,10 @@ class Clock:
 def otel(sm):
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
-    clock = Clock()
-    metrics = sm.SecurityMetrics(meter_getter=lambda: provider.get_meter(sm.METER_NAME), clock=clock)
-    return types.SimpleNamespace(metrics=metrics, reader=reader, clock=clock)
+    clock, timers = Clock(), []
+    metrics = sm.SecurityMetrics(meter_getter=lambda: provider.get_meter(sm.METER_NAME), clock=clock,
+                                 scheduler=lambda delay, fn: timers.append((delay, fn)))
+    return types.SimpleNamespace(metrics=metrics, reader=reader, clock=clock, timers=timers)
 
 
 def exported(reader):
@@ -147,6 +152,88 @@ def test_label_keys_are_limited_to_the_allow_list(sm, otel):
             otel.metrics.counter("m_total", "d", (key,))
 
 
+def test_a_burst_that_stops_inside_the_window_is_flushed_at_its_end(sm, otel, lines):
+    counter = otel.metrics.counter("worker_capability_reject_total", "d", ("capability",))
+
+    counter.inc(capability="a")
+    otel.clock.t += 3
+    counter.inc(capability="a")
+    counter.inc(2, capability="a")
+
+    assert lines == ["security_metric name=worker_capability_reject_total value=1 capability=a"]
+    assert [round(delay, 6) for delay, _ in otel.timers] == [7.0]
+    otel.clock.t += 7
+    otel.timers[0][1]()
+    otel.timers[0][1]()
+    assert lines[1:] == ["security_metric name=worker_capability_reject_total value=3 capability=a"]
+
+
+def test_a_flush_that_wakes_early_waits_out_the_window(sm, otel, lines):
+    counter = otel.metrics.counter("m_total", "d")
+
+    counter.inc()
+    counter.inc()
+    otel.clock.t += 10
+    counter.inc()
+    counter.inc()
+    otel.clock.t += 1
+    otel.timers[0][1]()
+    otel.clock.t += 9
+    otel.timers[1][1]()
+
+    assert lines == ["security_metric name=m_total value=1", "security_metric name=m_total value=2",
+                     "security_metric name=m_total value=1"]
+
+
+def test_a_scheduler_failure_does_not_break_the_caller(sm, otel, lines):
+    def broken(delay, fn):
+        raise RuntimeError("no timers")
+
+    counter = sm.SecurityMetrics(meter_getter=lambda: None, clock=otel.clock, scheduler=broken).counter("m_total", "d")
+
+    counter.inc()
+    counter.inc()
+    counter.inc()
+
+    assert counter.total() == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, None, "2"])
+def test_only_positive_integers_are_counted(otel, lines, value):
+    counter = otel.metrics.counter("m_total", "d")
+
+    counter.inc(value)
+
+    assert counter.total() == 0 and lines == [] and exported(otel.reader) == {}
+
+
+def test_debug_logs_the_exception_type_only(sm, monkeypatch):
+    debug = []
+    monkeypatch.setattr(log, "debug", lambda msg, *a: debug.append(msg % a), raising=False)
+
+    def broken_meter():
+        raise RuntimeError("secret detail")
+
+    sm.SecurityMetrics(meter_getter=broken_meter).counter("m_total", "d").inc()
+
+    assert debug == ["security_metric m_total: OpenTelemetry export failed: RuntimeError"]
+
+
+def test_declared_metrics_match_the_contract(plugin_root):
+    """Counters created through SECURITY_METRICS.counter(...) in this plugin: name -> label keys."""
+    import ast
+    declared = {}
+    for path in (plugin_root / "utils").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "counter"
+                    and getattr(node.func.value, "id", None) == "SECURITY_METRICS"):
+                assert isinstance(node.args[0], ast.Constant), f"{path}:{node.lineno}: literal metric name needed"
+                labels = node.args[2] if len(node.args) > 2 else ast.Tuple(elts=[])
+                declared[node.args[0].value] = tuple(e.value for e in labels.elts)
+
+    assert declared == DECLARED
+
+
 def test_label_value_is_bounded(sm):
     assert len(sm.label_value("x" * 500)) == sm.MAX_LABEL_VALUE_LEN
     assert sm.label_value("") == "-"
@@ -218,13 +305,67 @@ def test_gauge_registration_is_idempotent(otel):
     assert exported(otel.reader) == {("g", frozenset()): 1}
 
 
-def test_module_registers_the_tool_before_the_enabled_gate_and_unregisters_it(plugin_root):
-    source = (plugin_root / "module.py").read_text()
-    init = source[source.index("    def init(self):"):source.index("    def ready(self):")]
+@pytest.fixture
+def tracing_module(plugin_root, monkeypatch):
+    """module.py imported as a package, with pylon's ``module`` stubbed so ``Module`` can be defined."""
+    import pylon.core.tools as pylon_tools
+    monkeypatch.setattr(pylon_tools, "module", types.SimpleNamespace(ModuleModel=object), raising=False)
+    package = types.ModuleType("tracing_under_test")
+    package.__path__ = [str(plugin_root)]
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    spec = importlib.util.spec_from_file_location("tracing_under_test.module", plugin_root / "module.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    yield module
+    for name in [n for n in sys.modules if n.startswith("tracing_under_test")]:
+        sys.modules.pop(name, None)
 
-    assert init.index('self.descriptor.register_tool("security_metrics", SECURITY_METRICS)') \
-        < init.index("self._init_security_audit()") < init.index("if not self._enabled:")
-    assert 'self.descriptor.unregister_tool("security_metrics")' in source[source.index("    def deinit(self):"):]
+
+def fake_plugin(tracing_module, descriptor):
+    calls = []
+    plugin = types.SimpleNamespace(
+        descriptor=descriptor, config={}, _register_api=False, _security_audit_available=False,
+        _legacy_api=False, _enabled=False,
+        _init_security_audit=lambda: calls.append("audit"), _init_api=lambda: calls.append("api"))
+    return plugin, calls
+
+
+def test_init_registers_the_tool_before_audit_and_the_enabled_gate(tracing_module):
+    registered = []
+    descriptor = types.SimpleNamespace(
+        config={}, register_tool=lambda name, tool: registered.append((name, tool)))
+    plugin, calls = fake_plugin(tracing_module, descriptor)
+    descriptor.register_tool = lambda name, tool: (registered.append((name, tool)), calls.append("tool"))
+
+    tracing_module.Module.init(plugin)
+
+    assert registered == [("security_metrics", tracing_module.SECURITY_METRICS)]
+    assert calls[:2] == ["tool", "audit"]  # tracing is disabled in this fake: init stops at the gate
+
+
+def test_a_failing_register_tool_does_not_abort_init(tracing_module):
+    def clash(name, tool):
+        raise RuntimeError("tool already registered")
+
+    descriptor = types.SimpleNamespace(config={}, register_tool=clash)
+    plugin, calls = fake_plugin(tracing_module, descriptor)
+
+    tracing_module.Module.init(plugin)
+
+    assert calls == ["audit"]
+
+
+def test_deinit_unregisters_the_tool(tracing_module):
+    names = []
+    descriptor = types.SimpleNamespace(unregister_tool=names.append)
+    plugin = types.SimpleNamespace(descriptor=descriptor, _security_audit_relay=None)
+    try:
+        tracing_module.Module.deinit(plugin)
+    except AttributeError:
+        pass  # the rest of deinit needs the full plugin state; the tool is released first
+
+    assert names == ["security_metrics"]
 
 
 def test_contract_with_the_consumer_copies(sm, otel, lines):

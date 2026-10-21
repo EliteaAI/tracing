@@ -396,18 +396,24 @@ def test_metrics_snapshot(sa):
 
     assert len(session.statements) == 1  # depth and lag are read with one query
     sql = str(session.statements[0].compile(dialect=postgresql.dialect())).lower()
-    assert sql.count("select") == 3 and "count(" in sql and "max(" in sql
+    assert sql.count("select") == 3 and "count(" in sql and "min(" in sql and "security_audit_events.occurred_at" in sql
+    assert sql.count("delivery_state in") == 2 and "delivered_at" not in sql  # the delivery index, no scan on delivered_at
     assert snapshot["security_audit_outbox_depth"] == 7
     assert snapshot["security_audit_delivery_lag_seconds"] == 30
     assert snapshot["security_audit_drop_total"] == sa.sa.security_audit_drop_total.total()
 
 
-def test_lag_is_none_before_any_delivery(sa):
+def test_undelivered_means_pending_or_failed(sa):
+    assert set(sa.sa.UNDELIVERED_STATES) == {"pending", "failed"}
+
+
+def test_lag_is_zero_when_nothing_is_undelivered(sa):
     session = FakeSession(scalar=None)
 
     snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
 
-    assert snapshot["security_audit_delivery_lag_seconds"] is None
+    assert snapshot["security_audit_delivery_lag_seconds"] == 0
+    assert snapshot["security_audit_outbox_depth"] == 0
 
 
 def test_audit_gauges_use_the_audit_snapshot(sa, monkeypatch):

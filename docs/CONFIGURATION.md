@@ -323,8 +323,8 @@ security_audit:
 - RPC `security_audit_admission_allowed` returns `False` only under `fail_closed` when pending rows exceed
   `backlog_limit` (count cached for 5 s; an unreadable count is treated as exceeded). Nothing calls it yet.
 - In-process metrics: `utils.security_audit.security_audit_metrics()` returns
-  `security_audit_outbox_depth`, `security_audit_delivery_lag_seconds` (age of the last delivered row)
-  and `security_audit_drop_total`.
+  `security_audit_outbox_depth` (rows not delivered: pending or failed), `security_audit_delivery_lag_seconds`
+  (age of the oldest undelivered row, 0 when none) and `security_audit_drop_total`.
 - `would_deny` (optional bool, additive in v1; #7120): `true` = audit-only governance allowed the run but
   enforce would have refused it with `reason_code`; `false` = audit-only checked it and enforce would allow;
   `null` (omitted from the OCSF `unmapped` block) = an enforce or legacy event. Only a real bool is accepted.
@@ -348,28 +348,32 @@ in-process total per label set, and (c) writes one INFO log line through `pylon.
 security_metric name=<name> value=<n> <label>=<value> ...
 ```
 
-Label keys follow the metric's declared order. Values are reason codes, capability names or ids; each is
+Label keys follow the metric's declared order. Values are reason codes or capability names; each is
 reduced to one token (characters outside `A-Za-z0-9_.:/@+-` become `_`, at most 64 characters). The OTel
 export uses the tracing MeterProvider, so it needs `enabled: true`, `otlp.enabled: true` and
 `instrumentation.system_metrics` (the default); the log line is always written. Consumer plugins that cannot
-find the tool keep a local in-process counter and still write the log line.
+find the tool keep a local in-process counter and still write the log line (also when the tool raises). The
+consumer copies of the accessor are pinned byte for byte to `tests/reference/security_metrics_client.py` by a
+hash test in each repo.
 
 The only label key is `capability` (`ALLOWED_LABEL_KEYS`; a counter declaring another key is refused at
 creation), and values are enum-like codes, never identifiers or values. The log line is rate-capped per counter
 and label set: at most one line per `LOG_INTERVAL_S` (10 s); increments inside the window are folded into
-`value` of the next line (a burst that ends inside a window is not logged until that counter fires again).
+`value` of the next line, and one flush is scheduled at the end of the window (a gevent greenlet when gevent is
+patched in, else a daemon timer) so a burst that stops is still logged. `inc` accepts positive integers only.
 The OpenTelemetry counter and the in-process total always see every increment. The two audit gauges share one
 reading (one SQL statement, at most once per second per export).
 
 | Metric | Type | Labels | Recorded by |
 |--------|------|--------|-------------|
 | `governed_dispatch_unavailable_total` | counter | none | `elitea_core`: governed task refused, no live worker supports it |
-| `worker_capability_reject_total` | counter | `capability` | `indexer_worker`: envelope refused by the worker |
+| `governed_dispatch_without_slot_batch_total` | counter | none | `elitea_core`: governed task dispatched while no live worker announces the batch release of credential slots (never a refusal) |
+| `worker_capability_reject_total` | counter | `capability` | `indexer_worker`: envelope refused by the worker; the value is a known capability or `unknown`, at most 8 per task (it increments inside forked one-shot task children, so the log line is the record and the parent total stays 0) |
 | `auth_epoch_mismatch_total` | counter | none | `auth`: cached auth result built under an older epoch |
 | `auth_invalidate_events_total` | counter | none | `auth`: `auth_invalidate` event handled |
 | `security_audit_drop_total` | counter | none | `tracing`: audit event lost because the outbox write failed |
-| `security_audit_outbox_depth` | observable gauge | none | `tracing`: pending outbox rows, read on each export |
-| `security_audit_delivery_lag_seconds` | observable gauge (`s`) | none | `tracing`: age of the last delivered row; no sample before the first delivery |
+| `security_audit_outbox_depth` | observable gauge | none | `tracing`: undelivered (pending or failed) outbox rows, read on each export |
+| `security_audit_delivery_lag_seconds` | observable gauge (`s`) | none | `tracing`: age of the oldest undelivered row, 0 when nothing is undelivered (grows when the relay is dead, not on an idle outbox) |
 
 Example: `security_metric name=worker_capability_reject_total value=1 capability=task_envelope.v1`.
 

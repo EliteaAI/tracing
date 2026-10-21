@@ -21,13 +21,15 @@ from pylon.core.tools import log
 from sqlalchemy import func, select, text
 
 from ..models.security_audit_event import MAX_STRING_LENGTH, SecurityAuditEventV1
-from ..models.security_audit_outbox import SecurityAuditEvent, DELIVERY_PENDING
+from ..models.security_audit_outbox import SecurityAuditEvent, DELIVERY_FAILED, DELIVERY_PENDING
 from .security_metrics import SECURITY_METRICS
 
 FAIL_CLOSED = "fail_closed"
 BUFFER = "buffer"
 FAILURE_POLICIES = frozenset({FAIL_CLOSED, BUFFER})
 BACKLOG_CACHE_TTL_S = 5.0
+# Rows the relay has not delivered: still pending, or failed after max_attempts (never purged).
+UNDELIVERED_STATES = (DELIVERY_PENDING, DELIVERY_FAILED)
 # The two outbox gauges are read one after the other in one export; they share one reading.
 GAUGE_SNAPSHOT_TTL_S = 1.0
 
@@ -184,17 +186,21 @@ def security_audit_admission_allowed(**probe) -> bool:
 
 
 def security_audit_metrics(*, session_scope=None, now: Optional[datetime] = None) -> dict:
-    """Outbox depth, age of the last delivered row, and dropped-event total."""
+    """Undelivered outbox depth, age of the oldest undelivered row, and dropped-event total.
+
+    The age is 0 when nothing is undelivered, so it does not grow on an idle outbox and does grow
+    when the relay is dead. One statement; both subqueries filter on ``delivery_state`` and use
+    ``ix_security_audit_events_delivery``.
+    """
     now = now or datetime.now(timezone.utc)
-    pending = _pending_count_query().scalar_subquery()
-    last = select(func.max(SecurityAuditEvent.delivered_at)).scalar_subquery()
+    undelivered = SecurityAuditEvent.delivery_state.in_(UNDELIVERED_STATES)
+    depth_query = select(func.count()).select_from(SecurityAuditEvent).where(undelivered).scalar_subquery()
+    oldest_query = select(func.min(SecurityAuditEvent.occurred_at)).where(undelivered).scalar_subquery()
     with (session_scope or default_session_scope)() as session:
-        # One round trip for both gauges; each subquery keeps its own plan.
-        depth, last_delivered = session.execute(select(pending, last)).one()
+        depth, oldest = session.execute(select(depth_query, oldest_query)).one()
     return {
         "security_audit_outbox_depth": depth or 0,
-        "security_audit_delivery_lag_seconds": (
-            None if last_delivered is None else (now - last_delivered).total_seconds()),
+        "security_audit_delivery_lag_seconds": 0.0 if oldest is None else max((now - oldest).total_seconds(), 0.0),
         "security_audit_drop_total": security_audit_drop_total.total(),
     }
 
@@ -391,8 +397,8 @@ def register_audit_gauges(security_metrics=SECURITY_METRICS, clock=time.monotoni
             return cached["snapshot"]
 
     security_metrics.gauge_callback(
-        "security_audit_outbox_depth", "Pending security audit outbox rows",
+        "security_audit_outbox_depth", "Undelivered (pending or failed) security audit outbox rows",
         lambda: snapshot()["security_audit_outbox_depth"])
     security_metrics.gauge_callback(
-        "security_audit_delivery_lag_seconds", "Age of the last delivered security audit row",
+        "security_audit_delivery_lag_seconds", "Age of the oldest undelivered security audit row (0 when none)",
         lambda: snapshot()["security_audit_delivery_lag_seconds"], unit="s")

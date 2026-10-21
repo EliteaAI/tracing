@@ -71,7 +71,10 @@ class Module(module.ModuleModel):
         # Re-read config from descriptor (external config may have been merged after __init__)
         self.config = self.descriptor.config
         # Security metrics and audit are independent of the tracing and audit_trail flags (#6754, #6945)
-        self.descriptor.register_tool("security_metrics", SECURITY_METRICS)
+        try:
+            self.descriptor.register_tool("security_metrics", SECURITY_METRICS)
+        except Exception as e:  # a repeated init or a name clash must not abort tracing init
+            log.warning(f"security_metrics tool could not be registered: {type(e).__name__}")
         self._init_security_audit()
         # Determine if API endpoints should be registered (status/collect/otlp endpoints)
         # The security audit endpoints (#7120) are served wherever the outbox is; the older status,
