@@ -21,12 +21,17 @@ from pylon.core.tools import log
 from sqlalchemy import func, select, text
 
 from ..models.security_audit_event import MAX_STRING_LENGTH, SecurityAuditEventV1
-from ..models.security_audit_outbox import SecurityAuditEvent, DELIVERY_PENDING
+from ..models.security_audit_outbox import SecurityAuditEvent, DELIVERY_FAILED, DELIVERY_PENDING
+from .security_metrics import SECURITY_METRICS
 
 FAIL_CLOSED = "fail_closed"
 BUFFER = "buffer"
 FAILURE_POLICIES = frozenset({FAIL_CLOSED, BUFFER})
 BACKLOG_CACHE_TTL_S = 5.0
+# Rows the relay has not delivered: still pending, or failed after max_attempts (never purged).
+UNDELIVERED_STATES = (DELIVERY_PENDING, DELIVERY_FAILED)
+# The two outbox gauges are read one after the other in one export; they share one reading.
+GAUGE_SNAPSHOT_TTL_S = 1.0
 
 # Read side limits (#7120)
 DEFAULT_LIMIT = 20
@@ -43,23 +48,9 @@ class SecurityAuditUnavailable(RuntimeError):
     """The audit row could not be recorded and the policy is fail_closed."""
 
 
-class Counter:
-    """In-process monotonic counter (prometheus_client is not available in plugins)."""
-
-    def __init__(self):
-        self._value = 0
-        self._lock = threading.Lock()
-
-    def inc(self, amount: int = 1) -> None:
-        with self._lock:
-            self._value += amount
-
-    def total(self) -> int:
-        return self._value
-
-
 # Events lost because the outbox itself could not be written. Never increments under fail_closed.
-security_audit_drop_total = Counter()
+security_audit_drop_total = SECURITY_METRICS.counter(
+    "security_audit_drop_total", "Security audit events lost because the outbox could not be written")
 
 
 @dataclass(frozen=True)
@@ -195,15 +186,21 @@ def security_audit_admission_allowed(**probe) -> bool:
 
 
 def security_audit_metrics(*, session_scope=None, now: Optional[datetime] = None) -> dict:
-    """Outbox depth, age of the last delivered row, and dropped-event total."""
+    """Undelivered outbox depth, age of the oldest undelivered row, and dropped-event total.
+
+    The age is 0 when nothing is undelivered, so it does not grow on an idle outbox and does grow
+    when the relay is dead. One statement; both subqueries filter on ``UNDELIVERED_STATES``, which is
+    the predicate of the partial index ``ix_security_audit_events_undelivered`` (``ensure_undelivered_index``).
+    """
     now = now or datetime.now(timezone.utc)
+    undelivered = SecurityAuditEvent.delivery_state.in_(UNDELIVERED_STATES)
+    depth_query = select(func.count()).select_from(SecurityAuditEvent).where(undelivered).scalar_subquery()
+    oldest_query = select(func.min(SecurityAuditEvent.occurred_at)).where(undelivered).scalar_subquery()
     with (session_scope or default_session_scope)() as session:
-        depth = session.execute(_pending_count_query()).scalar_one()
-        last_delivered = session.execute(select(func.max(SecurityAuditEvent.delivered_at))).scalar_one()
+        depth, oldest = session.execute(select(depth_query, oldest_query)).one()
     return {
         "security_audit_outbox_depth": depth or 0,
-        "security_audit_delivery_lag_seconds": (
-            None if last_delivered is None else (now - last_delivered).total_seconds()),
+        "security_audit_delivery_lag_seconds": 0.0 if oldest is None else max((now - oldest).total_seconds(), 0.0),
         "security_audit_drop_total": security_audit_drop_total.total(),
     }
 
@@ -224,6 +221,28 @@ def ensure_would_deny_column(engine, schema: str) -> None:
         connection.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS would_deny BOOLEAN"))
         connection.execute(text(
             f"CREATE INDEX IF NOT EXISTS ix_security_audit_events_occurred ON {table} (occurred_at)"))
+
+
+def undelivered_predicate_sql() -> str:
+    """``delivery_state IN ('pending', 'failed')``: the gauge filter and the partial index predicate."""
+    return "delivery_state IN (%s)" % ", ".join("'%s'" % state for state in UNDELIVERED_STATES)
+
+
+def ensure_undelivered_index(engine, schema: str) -> None:
+    """Partial index for the outbox gauges: ``min(occurred_at)`` and ``count(*)`` over undelivered rows.
+
+    ``ix_security_audit_events_delivery`` is ``(delivery_state, next_attempt_at)`` and cannot answer
+    ``min(occurred_at)``; delivered rows are never purged, so without this the gauge query would walk them.
+    PostgreSQL only (partial index); idempotent; the same statement is in
+    ``migrations/007_add_undelivered_index_to_security_audit_events.sql``.
+    """
+    if getattr(getattr(engine, "dialect", None), "name", None) != "postgresql":
+        return
+    table = '"%s".security_audit_events' % schema.replace('"', '""')
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered ON {table} (occurred_at) "
+            f"WHERE {undelivered_predicate_sql()}"))
 
 
 # ========================
@@ -380,3 +399,28 @@ def summarize_security_events(since_hours: int, would_deny: Optional[bool] = Non
     with (session_scope or default_session_scope)() as session:
         return [{"decision": d, "would_deny": w, "reason_code": r, "count": n}
                 for d, w, r, n in session.execute(statement).all()]
+
+
+def register_audit_gauges(security_metrics=SECURITY_METRICS, clock=time.monotonic) -> None:
+    """Export outbox depth and delivery lag as observable gauges (read on each export).
+
+    Both gauges are served from one ``security_audit_metrics()`` reading (one query), refreshed
+    after ``GAUGE_SNAPSHOT_TTL_S``.
+    """
+    lock = threading.Lock()
+    cached = {"at": None, "snapshot": None}
+
+    def snapshot() -> dict:
+        with lock:
+            now = clock()
+            if cached["at"] is None or now - cached["at"] >= GAUGE_SNAPSHOT_TTL_S:
+                cached["snapshot"] = security_audit_metrics()
+                cached["at"] = now
+            return cached["snapshot"]
+
+    security_metrics.gauge_callback(
+        "security_audit_outbox_depth", "Undelivered (pending or failed) security audit outbox rows",
+        lambda: snapshot()["security_audit_outbox_depth"])
+    security_metrics.gauge_callback(
+        "security_audit_delivery_lag_seconds", "Age of the oldest undelivered security audit row (0 when none)",
+        lambda: snapshot()["security_audit_delivery_lag_seconds"], unit="s")

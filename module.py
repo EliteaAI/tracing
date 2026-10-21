@@ -18,6 +18,7 @@ from pylon.core.tools import module, log
 
 # Data type constants for telemetry routing
 from .core.data_types import TelemetryDataType, TELEMETRY_DATA_TYPE_KEY
+from .utils.security_metrics import SECURITY_METRICS
 
 # Check if api_tools is available (pylon_main/pylon_auth only)
 try:
@@ -62,6 +63,7 @@ class Module(module.ModuleModel):
         # Security audit outbox relay (#6945)
         self._security_audit_relay = None
         self._security_audit_available = False
+        self._security_metrics_registered = False
         self._legacy_api = False
         # Email cache moved to utils.user_context (service-level singleton)
 
@@ -69,7 +71,12 @@ class Module(module.ModuleModel):
         """Initialize the tracing plugin."""
         # Re-read config from descriptor (external config may have been merged after __init__)
         self.config = self.descriptor.config
-        # Security audit is independent of the tracing and audit_trail flags (#6945)
+        # Security metrics and audit are independent of the tracing and audit_trail flags (#6754, #6945)
+        try:
+            self.descriptor.register_tool("security_metrics", SECURITY_METRICS)
+            self._security_metrics_registered = True
+        except Exception as e:  # a repeated init or a name clash must not abort tracing init
+            log.warning(f"security_metrics tool could not be registered: {type(e).__name__}")
         self._init_security_audit()
         # Determine if API endpoints should be registered (status/collect/otlp endpoints)
         # The security audit endpoints (#7120) are served wherever the outbox is; the older status,
@@ -1013,10 +1020,15 @@ class Module(module.ModuleModel):
         # Other plugins call the security_audit_* methods whether or not tracing is enabled
         self.descriptor.init_methods()
         try:
+            security_audit.register_audit_gauges()
+        except Exception as e:
+            log.warning(f"Security audit gauges could not be registered: {e}")
+        try:
             from .models.security_audit_outbox import SecurityAuditEvent
 
             db.get_shared_metadata().create_all(bind=db.engine, tables=[SecurityAuditEvent.__table__])
             security_audit.ensure_would_deny_column(db.engine, SecurityAuditEvent.__table__.schema)
+            security_audit.ensure_undelivered_index(db.engine, SecurityAuditEvent.__table__.schema)
         except Exception as e:
             log.warning(f"Security audit table could not be created/verified: {e}")
         if settings.relay_enabled:
@@ -1331,6 +1343,14 @@ class Module(module.ModuleModel):
 
     def deinit(self):
         """Cleanup tracing resources."""
+        # Only the tool this module registered: a failed registration must not remove another plugin's tool
+        if getattr(self, "_security_metrics_registered", False):
+            try:
+                self.descriptor.unregister_tool("security_metrics")
+                self._security_metrics_registered = False
+            except Exception as e:
+                log.warning(f"Error unregistering security_metrics tool: {e}")
+
         if self._security_audit_relay:
             try:
                 self._security_audit_relay.stop()

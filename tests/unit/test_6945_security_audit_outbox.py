@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pylon.core.tools import log
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase
 
@@ -60,6 +61,7 @@ class FakeSession:
             scalars=lambda: types.SimpleNamespace(all=lambda: self.rows),
             scalar_one=lambda: self.scalar,
             scalar_one_or_none=lambda: self.scalar,
+            one=lambda: (self.scalar, self.scalar),
         )
 
 
@@ -387,30 +389,133 @@ def test_metrics_snapshot(sa):
     class Session(FakeSession):
         def execute(self, statement):
             self.statements.append(statement)
-            value = 7 if "count" in str(statement).lower() else NOW - timedelta(seconds=30)
-            return types.SimpleNamespace(scalar_one=lambda: value, scalar_one_or_none=lambda: value)
+            return types.SimpleNamespace(one=lambda: (7, NOW - timedelta(seconds=30)))
 
-    snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(Session()), now=NOW)
+    session = Session()
+    snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
 
+    assert len(session.statements) == 1  # depth and lag are read with one query
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect())).lower()
+    assert sql.count("select") == 3 and "count(" in sql and "min(" in sql and "security_audit_events.occurred_at" in sql
+    assert sql.count("delivery_state in") == 2 and "delivered_at" not in sql  # the delivery index, no scan on delivered_at
     assert snapshot["security_audit_outbox_depth"] == 7
     assert snapshot["security_audit_delivery_lag_seconds"] == 30
     assert snapshot["security_audit_drop_total"] == sa.sa.security_audit_drop_total.total()
 
 
-def test_lag_is_none_before_any_delivery(sa):
+def test_undelivered_means_pending_or_failed(sa):
+    assert set(sa.sa.UNDELIVERED_STATES) == {"pending", "failed"}
+
+
+class DdlEngine:
+    def __init__(self, dialect="postgresql"):
+        self.dialect = types.SimpleNamespace(name=dialect)
+        self.statements = []
+
+    def begin(self):
+        engine = self
+
+        class Scope:
+            def __enter__(self):
+                return types.SimpleNamespace(execute=lambda statement: engine.statements.append(str(statement)))
+
+            def __exit__(self, *exc):
+                return False
+        return Scope()
+
+
+def test_the_partial_index_ddl_matches_the_gauge_filter(sa):
+    engine = DdlEngine()
+    sa.sa.ensure_undelivered_index(engine, 'cen"try')
+
+    assert engine.statements == [
+        'CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered ON "cen""try".security_audit_events '
+        "(occurred_at) WHERE delivery_state IN ('pending', 'failed')"]
+    # the gauge statement filters on exactly the states of the index predicate
+    session = FakeSession()
+    session.execute = lambda statement: (session.statements.append(statement),
+                                         types.SimpleNamespace(one=lambda: (0, None)))[1]
+    sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
+    gauge_sql = str(session.statements[0].compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert gauge_sql.count("delivery_state IN ('pending', 'failed')") == 2
+    assert sa.sa.undelivered_predicate_sql() == "delivery_state IN ('pending', 'failed')"
+
+
+def test_the_partial_index_is_skipped_outside_postgresql(sa):
+    engine = DdlEngine("sqlite")
+
+    sa.sa.ensure_undelivered_index(engine, "main")
+
+    assert engine.statements == []
+
+
+def test_the_partial_index_migration_carries_the_same_statement(plugin_root):
+    sql = (plugin_root / "migrations" / "007_add_undelivered_index_to_security_audit_events.sql").read_text()
+
+    assert "CREATE INDEX IF NOT EXISTS ix_security_audit_events_undelivered" in sql
+    assert "(occurred_at)" in sql and "WHERE delivery_state IN ('pending', 'failed')" in sql
+
+
+def test_lag_is_zero_when_nothing_is_undelivered(sa):
     session = FakeSession(scalar=None)
 
     snapshot = sa.sa.security_audit_metrics(session_scope=scope_for(session), now=NOW)
 
-    assert snapshot["security_audit_delivery_lag_seconds"] is None
+    assert snapshot["security_audit_delivery_lag_seconds"] == 0
+    assert snapshot["security_audit_outbox_depth"] == 0
 
 
-def test_counter(sa):
-    counter = sa.sa.Counter()
-    counter.inc()
-    counter.inc(2)
+def test_audit_gauges_use_the_audit_snapshot(sa, monkeypatch):
+    registered = {}
 
-    assert counter.total() == 3
+    class Recorder:
+        def gauge_callback(self, name, description, fn, unit="1"):
+            registered[name] = (fn, unit)
+
+    monkeypatch.setattr(sa.sa, "security_audit_metrics", lambda: {
+        "security_audit_outbox_depth": 4, "security_audit_delivery_lag_seconds": 12.5})
+
+    sa.sa.register_audit_gauges(Recorder())
+
+    assert set(registered) == {"security_audit_outbox_depth", "security_audit_delivery_lag_seconds"}
+    assert registered["security_audit_outbox_depth"][0]() == 4
+    assert registered["security_audit_delivery_lag_seconds"] == (registered["security_audit_delivery_lag_seconds"][0], "s")
+    assert registered["security_audit_delivery_lag_seconds"][0]() == 12.5
+
+
+def test_both_gauges_share_one_reading_per_export(sa, monkeypatch):
+    registered, reads = {}, []
+
+    class Recorder:
+        def gauge_callback(self, name, description, fn, unit="1"):
+            registered[name] = fn
+
+    def reading():
+        reads.append(1)
+        return {"security_audit_outbox_depth": 4, "security_audit_delivery_lag_seconds": 2.5}
+
+    clock = Clock()
+    monkeypatch.setattr(sa.sa, "security_audit_metrics", reading)
+    sa.sa.register_audit_gauges(Recorder(), clock=clock)
+
+    assert registered["security_audit_outbox_depth"]() == 4
+    assert registered["security_audit_delivery_lag_seconds"]() == 2.5
+    assert len(reads) == 1
+    clock.t += sa.sa.GAUGE_SNAPSHOT_TTL_S
+    registered["security_audit_outbox_depth"]()
+    assert len(reads) == 2
+
+
+def test_drop_counter_is_the_shared_helper(sa, monkeypatch):
+    lines = []
+    monkeypatch.setattr(log, "info", lines.append, raising=False)
+    monkeypatch.setattr(sa.sa.security_audit_drop_total, "_log_state", {})  # no earlier line inside the window
+    before = sa.sa.security_audit_drop_total.total()
+    sa.sa.security_audit_drop_total.inc()
+
+    assert sa.sa.security_audit_drop_total.total() == before + 1
+    assert lines == ["security_metric name=security_audit_drop_total value=1"]
 
 
 def test_module_initialises_security_audit_before_the_tracing_enabled_gate(plugin_root):
