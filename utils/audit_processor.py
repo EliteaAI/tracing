@@ -17,6 +17,7 @@ Supports spans from:
 - Admin tasks (admin_task_execution)
 - Langfuse tool/LLM spans (langfuse.observation.type)
 - AuditLangChainCallback spans (audit.observation.type)
+- Input guardrail detections (audit.observation.type = guardrail, #6886)
 """
 
 import threading
@@ -192,6 +193,8 @@ class AuditSpanProcessor:
             return self._extract_tool(snap, attrs)
         elif obs_type == "generation" or audit_obs_type == "generation":
             return self._extract_llm(snap, attrs)
+        elif audit_obs_type == "guardrail":
+            return self._extract_guardrail(snap, attrs)
         return None
 
     # --- Per-type extractors ---
@@ -352,6 +355,24 @@ class AuditSpanProcessor:
             action=snap["name"],
             model_name=model_name,
             duration_ms=float(duration_ms) if duration_ms is not None else None,
+            is_error=bool(attrs.get("audit.is_error", False)),
+        )
+
+    def _extract_guardrail(self, snap, attrs):
+        """Audit-trail shape of an input-guardrail detection (#6886).
+
+        The action is ``input:<category>.<rule>:<action>``; the segment kind
+        (user_input, history, ...) rides in tool_name. The detected value is
+        never on the span, so there is nothing here to mask.
+        """
+        segment_kind = attrs.get("audit.tool.name")
+
+        return self._build_event(
+            snap=snap,
+            attrs=attrs,
+            event_type="guardrail",
+            action=attrs.get("audit.guardrail.action") or snap["name"],
+            tool_name=str(segment_kind) if segment_kind else None,
             is_error=bool(attrs.get("audit.is_error", False)),
         )
 
