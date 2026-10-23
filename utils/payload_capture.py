@@ -16,7 +16,7 @@ Usage:
 
 import json
 import re
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 
 # Default sensitive keys to mask (case-insensitive matching)
@@ -26,6 +26,12 @@ DEFAULT_SENSITIVE_KEYS = {
     'private_key', 'privatekey', 'access_token', 'refresh_token', 'session',
     'cookie', 'x-api-key', 'x-auth-token', 'jwt', 'key', 'cert', 'certificate',
 }
+
+# Request paths whose body is never captured, whatever the masking rules say: the body carries
+# a value that must not reach spans or logs (the write-only personal credential material, #7120).
+# Matched as a prefix of the request path; the query string is ignored. Configured
+# ``skip_body_paths`` extend this list and cannot remove entries.
+DEFAULT_SKIP_BODY_PATHS = ('/api/v2/secrets/credential_material/',)
 
 # Default max payload size in characters
 DEFAULT_MAX_SIZE = 4096
@@ -71,6 +77,7 @@ class PayloadCapture:
         additional_mask_keys: Optional[Set[str]] = None,
         mask_patterns: Optional[List[str]] = None,
         include_types: bool = True,
+        skip_body_paths: Optional[Iterable[str]] = None,
     ):
         """
         Initialize the payload capture utility.
@@ -82,7 +89,11 @@ class PayloadCapture:
             additional_mask_keys: Additional keys to mask (added to defaults)
             mask_patterns: Regex patterns for values to mask (e.g., API key patterns)
             include_types: Include type info for non-serializable objects
+            skip_body_paths: Request path prefixes whose body is never captured
+                (added to DEFAULT_SKIP_BODY_PATHS)
         """
+        self.skip_body_paths = tuple(dict.fromkeys(
+            (*DEFAULT_SKIP_BODY_PATHS, *(p for p in (skip_body_paths or ()) if p))))
         self.max_size = max_size
         self.max_depth = max_depth
         self.include_types = include_types
@@ -107,6 +118,11 @@ class PayloadCapture:
 
         # Add default patterns for common secrets
         self._add_default_patterns()
+
+    def skips_body(self, path: str) -> bool:
+        """True when the request body on ``path`` must not be captured (prefix match, query ignored)."""
+        path = re.sub(r'/{2,}', '/', (path or '').split('?', 1)[0].split('#', 1)[0])
+        return any(path.startswith(prefix) for prefix in self.skip_body_paths)
 
     def _add_default_patterns(self):
         """Add default regex patterns for common secret formats."""
@@ -382,6 +398,7 @@ def get_payload_capture(config: Optional[dict] = None) -> PayloadCapture:
             - max_size: int
             - max_depth: int
             - additional_mask_keys: list
+            - skip_body_paths: list of request path prefixes whose body is never captured
 
     Returns:
         PayloadCapture instance
@@ -393,6 +410,7 @@ def get_payload_capture(config: Optional[dict] = None) -> PayloadCapture:
             max_size=config.get('max_size', DEFAULT_MAX_SIZE),
             max_depth=config.get('max_depth', 5),
             additional_mask_keys=set(config.get('additional_mask_keys', [])),
+            skip_body_paths=config.get('skip_body_paths'),
         )
 
     if _default_capture is None:
