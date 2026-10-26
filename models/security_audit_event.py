@@ -30,6 +30,9 @@ OCSF_CLASS_BY_EVENT_TYPE = {
     "issuer_action": 3004,
     "lifecycle": 3004,
     "execution_outcome": 6003,
+    # A platform change made through the internal Elitea MCP on a user's behalf by a governed run (#7214): user_ref
+    # is the subject, agent_binding_ref the actor, runtime_identity_ref the run's security context
+    "platform_operation": 6003,
 }
 EVENT_TYPES = frozenset(OCSF_CLASS_BY_EVENT_TYPE)
 
