@@ -129,7 +129,7 @@ def test_sanitizer_error_never_echoes_the_value(m):
     ("admission", 3003), ("decision", 3003), ("approval", 3003),
     ("credential_acquired", 3002), ("probe", 3002), ("refresh", 3002),
     ("rotation", 3004), ("withdrawal", 3004), ("issuer_action", 3004), ("lifecycle", 3004),
-    ("execution_outcome", 6003),
+    ("execution_outcome", 6003), ("platform_operation", 6003),
 ])
 def test_ocsf_class_is_derived_from_event_type(m, event_type, ocsf):
     assert m.SecurityAuditEventV1(event_type=event_type).ocsf_class == ocsf
@@ -137,6 +137,18 @@ def test_ocsf_class_is_derived_from_event_type(m, event_type, ocsf):
 
 def test_every_event_type_has_an_ocsf_class(m):
     assert set(m.OCSF_CLASS_BY_EVENT_TYPE) == set(m.EVENT_TYPES)
+
+
+def test_a_platform_operation_names_subject_actor_context_operation_and_target(m):
+    """#7214: a write through the internal Elitea MCP by a governed run, in the v1 fields (no new column)."""
+    event = m.SecurityAuditEventV1(
+        event_type="platform_operation", decision="allow", reason_code="PLATFORM_OPERATION", project_id=2,
+        user_ref="idp:tid-1:oid-1", agent_binding_ref="9b2c6f1e-0000-4000-8000-000000000001",
+        runtime_identity_ref="context:6c1d5a2e-0000-4000-8000-000000000002", run_id="run-1",
+        operation_id="build:post_applications_prompt_lib", target_ref="POST /api/v2/elitea_core/applications/prompt_lib/2")
+    assert event.ocsf_class == 6003
+    with pytest.raises(ValidationError):   # the run token itself can never be the target
+        m.SecurityAuditEventV1(event_type="platform_operation", target_ref="Bearer eio1.abcdefghijklmnop")
 
 
 def test_conflicting_ocsf_class_is_rejected(m):
