@@ -450,22 +450,94 @@ def test_the_partial_index_is_skipped_outside_postgresql(sa):
     assert engine.statements == []
 
 
-def test_the_summary_index_covers_the_summary_query_and_waits_at_most_five_seconds(sa):
-    """#7294: the operator summary groups by decision, would_deny and reason_code over occurred_at: the index carries
-    all four, so PostgreSQL answers the window from the index alone."""
-    engine = DdlEngine()
-    sa.sa.ensure_summary_index(engine, 'cen"try')
-    assert engine.statements == [
-        "SET LOCAL lock_timeout = '5s'",
-        'CREATE INDEX IF NOT EXISTS ix_security_audit_events_summary ON "cen""try".security_audit_events '
-        "(occurred_at) INCLUDE (decision, would_deny, reason_code)"]
-    sqlite = DdlEngine("sqlite")
-    sa.sa.ensure_summary_index(sqlite, "main")
-    assert sqlite.statements == []
+class _Scope:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __enter__(self):
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ConcurrentEngine:
+    """An autocommit connection that answers the validity read of the index (None: missing) and records the rest."""
+
+    def __init__(self, valid_before=None, valid_after=True, dialect="postgresql"):
+        self.dialect = types.SimpleNamespace(name=dialect)
+        self.statements, self.options, self.answers = [], [], [valid_before, valid_after]
+
+    def connect(self):
+        engine = self
+
+        class Connection:
+            def execution_options(self, **options):
+                engine.options.append(options)
+                return self
+
+            def execute(self, statement, params=None):
+                engine.statements.append(str(statement))
+                answer = engine.answers.pop(0) if "indisvalid" in str(statement) else None
+                return types.SimpleNamespace(scalar=lambda: answer)
+
+        class Scope:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, *exc):
+                return False
+        return Scope()
+
+
+def test_the_summary_index_is_built_concurrently_in_autocommit_and_covers_the_summary(sa):
+    """#7294 (review S5): the outbox takes every audit write and is never purged, so the build must not block it:
+    CONCURRENTLY, in autocommit, waiting at most 5 s for its locks; the index carries the summary's columns."""
+    engine = ConcurrentEngine()
+    assert sa.sa.ensure_summary_index(engine, 'cen"try') is True
+    assert engine.options == [{"isolation_level": "AUTOCOMMIT"}]
+    built = [s for s in engine.statements if "indisvalid" not in s]
+    assert built == [
+        "SET lock_timeout = '5s'",
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_security_audit_events_summary ON "cen""try".security_audit_events '
+        "(occurred_at) INCLUDE (decision, would_deny, reason_code)",
+        "RESET lock_timeout"]
     [index] = [item for item in sa.outbox.SecurityAuditEvent.__table__.indexes
                if item.name == "ix_security_audit_events_summary"]
     assert [column.name for column in index.columns] == ["occurred_at"]
     assert index.dialect_options["postgresql"]["include"] == ["decision", "would_deny", "reason_code"]
+
+
+def test_a_valid_summary_index_is_left_alone_and_an_invalid_one_is_left_to_migration_008(sa, monkeypatch):
+    present = ConcurrentEngine(valid_before=True)
+    assert sa.sa.ensure_summary_index(present, "centry") is True
+    assert [s for s in present.statements if "indisvalid" not in s] == []   # steady state: one catalog read
+    warned = []
+    monkeypatch.setattr(sa.sa.log, "warning", lambda *args: warned.append(args))
+    broken = ConcurrentEngine(valid_before=False)
+    assert sa.sa.ensure_summary_index(broken, "centry") is False
+    assert [s for s in broken.statements if "indisvalid" not in s] == []   # not rebuilt over an invalid one
+    timed_out = ConcurrentEngine(valid_before=None, valid_after=False)   # the build stopped at its lock timeout
+    real_connect = timed_out.connect
+
+    def raising_connect():
+        scope = real_connect()
+        inner = scope.__enter__()
+        real_execute = inner.execute
+
+        def execute(statement, params=None):
+            if "CREATE INDEX" in str(statement):
+                timed_out.statements.append(str(statement))
+                raise RuntimeError("canceling statement due to lock timeout")
+            return real_execute(statement, params)
+        inner.execute = execute
+        return types.SimpleNamespace(__enter__=lambda: inner, __exit__=lambda *exc: False)
+
+    timed_out.connect = lambda: _Scope(raising_connect())
+    assert sa.sa.ensure_summary_index(timed_out, "centry") is False
+    assert timed_out.statements[-2:] == ["RESET lock_timeout", timed_out.statements[-1]]   # reset, then re-read
+    assert len([w for w in warned if "008_add_summary_index" in " ".join(map(str, w))]) == 2
+    assert sa.sa.ensure_summary_index(ConcurrentEngine(dialect="sqlite"), "main") is None
 
 
 def test_the_summary_index_migration_carries_the_same_index(plugin_root):

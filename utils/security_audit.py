@@ -247,23 +247,43 @@ def ensure_undelivered_index(engine, schema: str) -> None:
 
 SUMMARY_INDEX = "ix_security_audit_events_summary"
 SUMMARY_INDEX_LOCK_TIMEOUT = "5s"
+_INDEX_VALID = text(
+    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = :name AND n.nspname = :schema")
 
 
-def ensure_summary_index(engine, schema: str) -> None:
+def ensure_summary_index(engine, schema: str) -> Optional[bool]:
     """Covering index of the operator summary (#7294): ``summarize_security_events`` groups the window's rows by
     decision, would_deny and reason_code; with them in the index the window is read from the index alone, not from
-    every row of it. PostgreSQL only (``INCLUDE``); idempotent; waits at most ``SUMMARY_INDEX_LOCK_TIMEOUT`` for the
-    table (a busy outbox is tried again at the next start). ``migrations/008_add_summary_index_to_security_audit_events.sql``
-    builds it ``CONCURRENTLY`` ahead of a deploy, for a large outbox.
-    """
+    every row of it. PostgreSQL only (``INCLUDE``).
+
+    Built ``CONCURRENTLY`` (autocommit): the outbox is never purged and takes every governed audit write, which a plain
+    build would block for its whole duration. Waits at most ``SUMMARY_INDEX_LOCK_TIMEOUT`` for its locks. An index left
+    invalid (an interrupted or timed-out build) is reported and left to
+    ``migrations/008_add_summary_index_to_security_audit_events.sql`` (drop it, run the file). Returns whether a valid
+    index is there (None outside PostgreSQL)."""
     if getattr(getattr(engine, "dialect", None), "name", None) != "postgresql":
-        return
+        return None
     table = '"%s".security_audit_events' % schema.replace('"', '""')
-    with engine.begin() as connection:
-        connection.execute(text(f"SET LOCAL lock_timeout = '{SUMMARY_INDEX_LOCK_TIMEOUT}'"))
-        connection.execute(text(
-            f"CREATE INDEX IF NOT EXISTS {SUMMARY_INDEX} ON {table} (occurred_at) "
-            "INCLUDE (decision, would_deny, reason_code)"))
+    params = {"name": SUMMARY_INDEX, "schema": schema}
+    with engine.connect() as connection:
+        connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+        valid = connection.execute(_INDEX_VALID, params).scalar()
+        if valid is None:
+            connection.execute(text(f"SET lock_timeout = '{SUMMARY_INDEX_LOCK_TIMEOUT}'"))
+            try:
+                connection.execute(text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {SUMMARY_INDEX} ON {table} (occurred_at) "
+                    "INCLUDE (decision, would_deny, reason_code)"))
+            except Exception as exc:  # pylint: disable=W0703  # e.g. the lock timeout: what it left is read below
+                log.warning("Security audit summary index build stopped (%s)", type(exc).__name__)
+            finally:
+                connection.execute(text("RESET lock_timeout"))
+            valid = connection.execute(_INDEX_VALID, params).scalar()
+    if valid is not True:
+        log.warning("Security audit summary index %s is not valid; drop it and run migration "
+                    "008_add_summary_index_to_security_audit_events.sql", SUMMARY_INDEX)
+    return valid is True
 
 
 # ========================
