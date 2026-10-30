@@ -281,8 +281,9 @@ def ensure_summary_index(engine, schema: str) -> Optional[bool]:
                 connection.execute(text("RESET lock_timeout"))
             valid = connection.execute(_INDEX_VALID, params).scalar()
     if valid is not True:
-        log.warning("Security audit summary index %s is not valid; drop it and run migration "
-                    "008_add_summary_index_to_security_audit_events.sql", SUMMARY_INDEX)
+        log.warning("Security audit summary index %s is not valid (or another replica is still building it); if it "
+                    "stays invalid, drop it and run migration 008_add_summary_index_to_security_audit_events.sql",
+                    SUMMARY_INDEX)
     return valid is True
 
 
