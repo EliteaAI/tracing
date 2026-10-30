@@ -26,6 +26,9 @@ class SecurityAuditEvent(db.Base):
         Index('ix_security_audit_events_run_id', 'run_id'),
         Index('ix_security_audit_events_credential_ref', 'credential_ref'),
         Index('ix_security_audit_events_occurred', 'occurred_at'),
+        # the operator summary (#7294): the window and the grouped columns, read from the index alone
+        Index('ix_security_audit_events_summary', 'occurred_at',
+              postgresql_include=['decision', 'would_deny', 'reason_code']),
         Index('ux_security_audit_events_event_id', 'event_id', unique=True),
         {'schema': c.POSTGRES_SCHEMA},
     )
