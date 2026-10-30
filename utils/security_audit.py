@@ -245,6 +245,27 @@ def ensure_undelivered_index(engine, schema: str) -> None:
             f"WHERE {undelivered_predicate_sql()}"))
 
 
+SUMMARY_INDEX = "ix_security_audit_events_summary"
+SUMMARY_INDEX_LOCK_TIMEOUT = "5s"
+
+
+def ensure_summary_index(engine, schema: str) -> None:
+    """Covering index of the operator summary (#7294): ``summarize_security_events`` groups the window's rows by
+    decision, would_deny and reason_code; with them in the index the window is read from the index alone, not from
+    every row of it. PostgreSQL only (``INCLUDE``); idempotent; waits at most ``SUMMARY_INDEX_LOCK_TIMEOUT`` for the
+    table (a busy outbox is tried again at the next start). ``migrations/008_add_summary_index_to_security_audit_events.sql``
+    builds it ``CONCURRENTLY`` ahead of a deploy, for a large outbox.
+    """
+    if getattr(getattr(engine, "dialect", None), "name", None) != "postgresql":
+        return
+    table = '"%s".security_audit_events' % schema.replace('"', '""')
+    with engine.begin() as connection:
+        connection.execute(text(f"SET LOCAL lock_timeout = '{SUMMARY_INDEX_LOCK_TIMEOUT}'"))
+        connection.execute(text(
+            f"CREATE INDEX IF NOT EXISTS {SUMMARY_INDEX} ON {table} (occurred_at) "
+            "INCLUDE (decision, would_deny, reason_code)"))
+
+
 # ========================
 # Read side (#7120)
 # ========================

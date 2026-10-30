@@ -450,6 +450,30 @@ def test_the_partial_index_is_skipped_outside_postgresql(sa):
     assert engine.statements == []
 
 
+def test_the_summary_index_covers_the_summary_query_and_waits_at_most_five_seconds(sa):
+    """#7294: the operator summary groups by decision, would_deny and reason_code over occurred_at: the index carries
+    all four, so PostgreSQL answers the window from the index alone."""
+    engine = DdlEngine()
+    sa.sa.ensure_summary_index(engine, 'cen"try')
+    assert engine.statements == [
+        "SET LOCAL lock_timeout = '5s'",
+        'CREATE INDEX IF NOT EXISTS ix_security_audit_events_summary ON "cen""try".security_audit_events '
+        "(occurred_at) INCLUDE (decision, would_deny, reason_code)"]
+    sqlite = DdlEngine("sqlite")
+    sa.sa.ensure_summary_index(sqlite, "main")
+    assert sqlite.statements == []
+    [index] = [item for item in sa.outbox.SecurityAuditEvent.__table__.indexes
+               if item.name == "ix_security_audit_events_summary"]
+    assert [column.name for column in index.columns] == ["occurred_at"]
+    assert index.dialect_options["postgresql"]["include"] == ["decision", "would_deny", "reason_code"]
+
+
+def test_the_summary_index_migration_carries_the_same_index(plugin_root):
+    sql = (plugin_root / "migrations" / "008_add_summary_index_to_security_audit_events.sql").read_text()
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_security_audit_events_summary" in sql
+    assert "(occurred_at)" in sql and "INCLUDE (decision, would_deny, reason_code)" in sql
+
+
 def test_the_partial_index_migration_carries_the_same_statement(plugin_root):
     sql = (plugin_root / "migrations" / "007_add_undelivered_index_to_security_audit_events.sql").read_text()
 
