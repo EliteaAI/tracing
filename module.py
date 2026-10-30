@@ -1031,6 +1031,10 @@ class Module(module.ModuleModel):
             security_audit.ensure_undelivered_index(db.engine, SecurityAuditEvent.__table__.schema)
         except Exception as e:
             log.warning(f"Security audit table could not be created/verified: {e}")
+        try:   # #7294: last and on its own, so a busy outbox (its lock timeout) stops nothing above
+            security_audit.ensure_summary_index(db.engine, SecurityAuditEvent.__table__.schema)
+        except Exception as e:  # pylint: disable=W0703
+            log.warning(f"Security audit summary index could not be built now ({type(e).__name__}); next start")
         if settings.relay_enabled:
             from .utils.security_audit_relay import SecurityAuditRelay, JsonLinesFileSink
 
