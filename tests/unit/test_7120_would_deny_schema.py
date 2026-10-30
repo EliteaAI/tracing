@@ -106,6 +106,17 @@ def test_init_upgrades_an_existing_outbox_right_after_create_all(plugin_root):
     assert body.index("ensure_would_deny_column(") < body.index("security_audit.ensure_undelivered_index(db.engine")
 
 
+def test_init_builds_the_summary_index_after_the_other_upgrades_in_its_own_try(plugin_root):
+    """#7294 (review S5): the summary index is built at start, last, in a try of its own."""
+    source = (plugin_root / "module.py").read_text()
+    body = source.split("def _init_security_audit(self):", 1)[1].split("\n    def ", 1)[0]
+
+    assert body.index("security_audit.ensure_undelivered_index(db.engine") < body.index(
+        "security_audit.ensure_summary_index(db.engine")
+    between = body[body.index("ensure_undelivered_index("):body.index("ensure_summary_index(")]
+    assert "except Exception" in between and "try:" in between
+
+
 def test_api_is_registered_when_the_outbox_exists_even_without_register_api(plugin_root):
     source = (plugin_root / "module.py").read_text()
 
