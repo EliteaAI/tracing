@@ -1,26 +1,14 @@
-"""Audit callback works when langchain_core dispatches events to it.
+"""Unit tests: langchain_core dispatches tool events to the audit callback.
 
 langchain_core reads ``handler.run_inline`` when it dispatches an async tool
 start event. A handler without that attribute makes every async tool start
 raise AttributeError, so callers fall back to the sync path.
-
-Run in a runtime that has langchain_core and the OpenTelemetry SDK:
-    python3 -m pytest utils/tests/test_audit_callback_dispatch.py -q
 """
-
 import asyncio
-import pathlib
-import sys
-import types
-import unittest.mock as mock
+import importlib.util
 import uuid
 
 import pytest
-
-
-pytest.importorskip("opentelemetry.sdk.trace")
-pytest.importorskip("langchain_core")
-
 from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler, CallbackManager
 from langchain_core.tools import tool
 from opentelemetry.sdk.trace import TracerProvider
@@ -28,28 +16,22 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
-_pylon = types.ModuleType("pylon")
-_pylon_core = types.ModuleType("pylon.core")
-_pylon_tools = types.ModuleType("pylon.core.tools")
-_pylon_tools.log = mock.MagicMock()
-_pylon.core = _pylon_core
-_pylon_core.tools = _pylon_tools
-sys.modules.setdefault("pylon", _pylon)
-sys.modules.setdefault("pylon.core", _pylon_core)
-sys.modules.setdefault("pylon.core.tools", _pylon_tools)
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-
-from audit_langchain_callback import AuditLangChainCallback
+@pytest.fixture
+def callback_cls(utils_path):
+    spec = importlib.util.spec_from_file_location(
+        'audit_langchain_callback_dispatch', utils_path / 'audit_langchain_callback.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.AuditLangChainCallback
 
 
 @pytest.fixture
-def audit():
+def audit(callback_cls):
     """A callback that writes to its own in-memory exporter, plus that exporter."""
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    handler = AuditLangChainCallback(user_id=42, project_id=7)
+    handler = callback_cls(user_id=42, project_id=7)
     handler._tracer = provider.get_tracer("audit-trail")
     return handler, exporter
 
@@ -61,8 +43,8 @@ def _tool_spans(exporter):
     ]
 
 
-def test_handler_is_a_langchain_callback_handler():
-    handler = AuditLangChainCallback()
+def test_handler_is_a_langchain_callback_handler(callback_cls):
+    handler = callback_cls()
     assert isinstance(handler, BaseCallbackHandler)
     assert handler.run_inline is False
 
