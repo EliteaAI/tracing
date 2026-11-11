@@ -9,6 +9,7 @@ import json
 import os
 import time
 
+from langchain_core.callbacks import BaseCallbackHandler
 from pylon.core.tools import log
 
 AUDIT_TRACER_NAME = "audit-trail"
@@ -20,10 +21,13 @@ try:
 except Exception:
     _PLUGIN_VERSION = "0.0.0"
 
-class AuditLangChainCallback:
+class AuditLangChainCallback(BaseCallbackHandler):
     """Creates OTEL spans for tool/LLM events when Langfuse is not available.
 
     Implements the LangChain callback interface methods needed for audit tracking.
+    It subclasses BaseCallbackHandler because langchain_core reads handler
+    attributes such as run_inline when it dispatches async events; a plain
+    object fails there and the caller falls back to the sync path.
     Uses the platform's own OTEL tracer (not Langfuse) to create spans that
     flow through the AuditSpanProcessor.
     """

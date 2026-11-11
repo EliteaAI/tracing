@@ -16,6 +16,7 @@ import pytest
 
 
 pytest.importorskip("opentelemetry.sdk.trace")
+pytest.importorskip("langchain_core")
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
