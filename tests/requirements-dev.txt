@@ -4,5 +4,8 @@ pydantic>=2.0
 sqlalchemy>=2.0
 # #7120 tests drive the Flask request hooks and the API handlers, and read spans back through the OTel SDK
 flask>=2.0
+opentelemetry-api>=1.20.0
 opentelemetry-sdk>=1.20.0
 requests>=2.31.0
+# the audit callback tests build a real langchain callback handler
+langchain-core>=1.0.0

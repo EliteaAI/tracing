@@ -1,51 +1,32 @@
-"""Audit callback trace correlation contract.
-
-Run in the indexer runtime, where OpenTelemetry SDK is supplied by sdk_plugin:
-    PYTHONPATH=/data/requirements/sdk_plugin/lib/python3.12/site-packages \
-        python3 -m pytest utils/tests/test_audit_trace_correlation.py -q
-"""
-
+"""Unit tests: audit callback trace correlation contract."""
 import contextvars
-import pathlib
-import sys
+import importlib.util
 import threading
-import types
-import unittest.mock as mock
 
 import pytest
-
-
-pytest.importorskip("opentelemetry.sdk.trace")
-
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
-_pylon = types.ModuleType("pylon")
-_pylon_core = types.ModuleType("pylon.core")
-_pylon_tools = types.ModuleType("pylon.core.tools")
-_pylon_tools.log = mock.MagicMock()
-_pylon.core = _pylon_core
-_pylon_core.tools = _pylon_tools
-sys.modules.setdefault("pylon", _pylon)
-sys.modules.setdefault("pylon.core", _pylon_core)
-sys.modules.setdefault("pylon.core.tools", _pylon_tools)
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-
-from audit_langchain_callback import AuditLangChainCallback
+@pytest.fixture
+def callback_cls(utils_path):
+    spec = importlib.util.spec_from_file_location(
+        'audit_langchain_callback_correlation', utils_path / 'audit_langchain_callback.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.AuditLangChainCallback
 
 
-def test_audit_generation_is_a_child_of_owning_application_without_content():
+def test_audit_generation_is_a_child_of_owning_application_without_content(callback_cls):
     """Audit callback preserves attribution without storing prompt or output content."""
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
 
-    callback = AuditLangChainCallback(user_id=42, project_id=7)
+    callback = callback_cls(user_id=42, project_id=7)
     tracer = trace.get_tracer("suggestion-audit-contract")
 
     with tracer.start_as_current_span("application") as application_span:
