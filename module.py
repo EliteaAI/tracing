@@ -1055,10 +1055,17 @@ class Module(module.ModuleModel):
         log.info(f"Audit trail enabled (mode={self._audit_mode})")
 
         if self._audit_mode == 'writer':
-            # Writer mode (pylon_main): set up DB table and EventNode subscriber
+            # Writer mode (pylon_main): set up DB table and EventNode subscriber.
+            # Pylons without the `db` tool (pylon_auth) cannot persist events: skip quietly.
+            try:
+                from tools import db  # pylint: disable=C0415
+            except ImportError:
+                log.info("Audit trail writer not available here (no db tool); skipping")
+                self._audit_enabled = False
+                return
             try:
                 from .models.audit_event import AuditEvent  # noqa: F401
-                from tools import db, auth, config as c
+                from tools import auth, config as c
 
                 db.get_shared_metadata().create_all(bind=db.engine)
                 log.info("Audit trail DB table created/verified")
